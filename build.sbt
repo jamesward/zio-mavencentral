@@ -1,0 +1,41 @@
+organization := "com.jamesward"
+
+name := "zio-mavencentral"
+
+scalaVersion := "3.3.0"
+
+scalacOptions ++= Seq(
+  "-Yexplicit-nulls",
+  "-language:strictEquality",
+  "-Xfatal-warnings",
+)
+
+val zioVersion = "2.0.13"
+
+libraryDependencies ++= Seq(
+  "dev.zio" %% "zio"                % zioVersion,
+  "dev.zio" %% "zio-direct"         % "1.0.0-RC7",
+  "dev.zio" %% "zio-direct-streams" % "1.0.0-RC7",
+  "dev.zio" %% "zio-http"           % "3.0.0-RC2",
+
+  "org.apache.commons" %  "commons-compress" % "1.23.0",
+
+  "dev.zio" %% "zio-test"           % zioVersion % Test,
+  "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
+  "dev.zio" %% "zio-test-magnolia"  % zioVersion % Test,
+)
+
+testFrameworks += new TestFramework("zio.test.sbt.ZTestFramework")
+
+fork := true
+
+licenses := Seq("MIT License" -> url("http://opensource.org/licenses/MIT"))
+
+developers := List(
+  Developer(
+    "jamesward",
+    "James Ward",
+    "james@jamesward.com",
+    url("https://jamesward.com")
+  )
+)
