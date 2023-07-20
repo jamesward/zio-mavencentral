@@ -29,6 +29,8 @@ testFrameworks += new TestFramework("zio.test.sbt.ZTestFramework")
 
 fork := true
 
+javaOptions += "-Djava.net.preferIPv4Stack=true"
+
 licenses := Seq("MIT License" -> url("http://opensource.org/licenses/MIT"))
 
 developers := List(
