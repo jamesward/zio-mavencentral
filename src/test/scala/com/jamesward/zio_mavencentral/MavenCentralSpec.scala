@@ -79,4 +79,11 @@ object MavenCentralSpec extends ZIOSpecDefault:
       val url = Url("https://repo1.maven.org/maven2/com/jamesward/travis-central-test/0.0.15/travis-central-test-0.0.15.jar")
       val tmpFile = Files.createTempDirectory("test").nn.toFile.nn
       downloadAndExtractZip(url, tmpFile).as(assertTrue(tmpFile.list().nn.contains("META-INF")))
+    ,
+    test("getVersionsWithFallback"):
+      val artifactUrl = "https://zxcvasdf123124zxcv.com/"
+      val fallbackArtifactUrl = MavenCentral.artifactUri
+      defer:
+        val versions = getVersionsWithFallback(artifactUrl, fallbackArtifactUrl, GroupId("io.grpc"), ArtifactId("grpc-kotlin-stub")).run
+        assertTrue(versions.nonEmpty)
   ).provide(Client.default)

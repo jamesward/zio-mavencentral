@@ -4,17 +4,12 @@ import org.apache.commons.compress.archivers.ArchiveEntry
 import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream
 import zio.direct.*
 import zio.http.{Client, Method, Path, Response, Status}
-import zio.stream.{ZPipeline, ZStream}
-import zio.{Console, Scope, ZIO}
+import zio.stream.ZPipeline
+import zio.{Scope, ZIO}
 
-import java.io.{File, InputStream}
-import java.net.{URL, URLEncoder}
+import java.io.File
 import java.nio.file.Files
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.jar.JarInputStream
 import scala.annotation.targetName
-import scala.util.Try
 import scala.util.matching.Regex
 
 object MavenCentral:
@@ -30,6 +25,7 @@ object MavenCentral:
 
   // todo: regionalize to maven central mirrors for lower latency
   val artifactUri = "https://repo1.maven.org/maven2/"
+  val fallbackArtifactUri = "https://repo.maven.apache.org/maven2/"
 
   case class GroupIdNotFoundError(groupId: GroupId)
   case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
@@ -116,12 +112,13 @@ object MavenCentral:
           responseToNames(response).run.map(ArtifactId(_)).sorted(CaseInsensitiveOrdering)
         case _ =>
           ZIO.fail(UnknownError(response)).run
-  // todo: retry once on Throwable
 
-  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
-    val url = artifactUri + artifactPath(groupId, Some(ArtifactAndVersion(artifactId))).addTrailingSlash
+  private def getVersions(baseUrl: String, groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
+    val url = baseUrl + artifactPath(groupId, Some(ArtifactAndVersion(artifactId))).addTrailingSlash
     defer:
+      ZIO.log(s"GET $url").run
       val response = Client.request(url).run
+      ZIO.log(s"GET $url - ${response.status}").run
       response.status match
         case Status.NotFound =>
           ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
@@ -129,6 +126,15 @@ object MavenCentral:
           responseToNames(response).run.map(Version(_)).reverse
         case _ =>
           ZIO.fail(UnknownError(response)).run
+
+  def getVersionsWithFallback(baseUrl: String, fallbackBaseUrl: String, groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
+    getVersions(baseUrl, groupId, artifactId)
+      .catchSome:
+        case _: Throwable =>
+          getVersions(fallbackBaseUrl, groupId, artifactId)
+
+  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
+    getVersionsWithFallback(artifactUri, fallbackArtifactUri, groupId, artifactId)
 
   def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
     searchVersions(groupId, artifactId).map(_.headOption)
