@@ -80,10 +80,10 @@ object MavenCentralSpec extends ZIOSpecDefault:
       val tmpFile = Files.createTempDirectory("test").nn.toFile.nn
       downloadAndExtractZip(url, tmpFile).as(assertTrue(tmpFile.list().nn.contains("META-INF")))
     ,
-    test("getVersionsWithFallback"):
+    test("requestWithFallbackurl"):
       val artifactUrl = "https://zxcvasdf123124zxcv.com/"
-      val fallbackArtifactUrl = MavenCentral.artifactUri
+      val fallbackArtifactUrl = "https://repo1.maven.org/maven2/"
       defer:
-        val versions = getVersionsWithFallback(artifactUrl, fallbackArtifactUrl, GroupId("io.grpc"), ArtifactId("grpc-kotlin-stub")).run
-        assertTrue(versions.nonEmpty)
+        val (response, _) = Client.requestWithFallback(Path.decode("com/jamesward/maven-metadata.xml"), primaryBaseUrl = artifactUrl, fallbackBaseUrl = fallbackArtifactUrl).run
+        assertTrue(response.status.isSuccess)
   ).provide(Client.default)

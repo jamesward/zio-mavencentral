@@ -3,13 +3,13 @@ package com.jamesward.zio_mavencentral
 import org.apache.commons.compress.archivers.ArchiveEntry
 import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream
 import zio.direct.*
-import zio.http.{Client, Method, Path, Response, Status}
+import zio.http.{Body, Client, Headers, Method, Path, Response, Status}
 import zio.stream.ZPipeline
-import zio.{Scope, ZIO}
+import zio.{Cause, Scope, Trace, ZIO}
 
 import java.io.File
 import java.nio.file.Files
-import scala.annotation.targetName
+import scala.annotation.{targetName, unused}
 import scala.util.matching.Regex
 
 object MavenCentral:
@@ -24,8 +24,8 @@ object MavenCentral:
   given CanEqual[Status, Status] = CanEqual.derived
 
   // todo: regionalize to maven central mirrors for lower latency
-  val artifactUri = "https://repo1.maven.org/maven2/"
-  val fallbackArtifactUri = "https://repo.maven.apache.org/maven2/"
+  private val artifactUri = "https://repo1.maven.org/maven2/"
+  private val fallbackArtifactUri = "https://repo.maven.apache.org/maven2/"
 
   case class GroupIdNotFoundError(groupId: GroupId)
   case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
@@ -35,6 +35,7 @@ object MavenCentral:
 
   extension (path: Path)
     @targetName("slash")
+    @unused
     def /(version: Version): Path = path / version
 
   opaque type GroupId = String
@@ -55,7 +56,7 @@ object MavenCentral:
   object Version:
     def apply(s: String): Version = s
     def unapply(s: String): Option[Version] = Some(s)
-    val latest = Version("latest")
+    val latest: Version = Version("latest")
 
   opaque type Url = String
   object Url:
@@ -66,10 +67,13 @@ object MavenCentral:
     lazy val toPath: Path = groupId / artifactId
 
     @targetName("slash")
+    @unused
     def /(version: Version): Path = toPath / version
 
   case class GroupArtifactVersion(groupId: GroupId, artifactId: ArtifactId, version: Version):
+    @unused
     lazy val noVersion: GroupArtifact = GroupArtifact(groupId, artifactId)
+    @unused
     lazy val toPath: Path = groupId / artifactId / version
     override def toString: String = s"$groupId/$artifactId/$version"
 
@@ -81,7 +85,6 @@ object MavenCentral:
     val withGroup = groupId.split('.').foldLeft(Path.empty)(_ / _)
     val withArtifact = artifactAndVersion.fold(withGroup)(withGroup / _.artifactId)
     val withVersion = artifactAndVersion.flatMap(_.maybeVersion).fold(withArtifact)(withArtifact / _)
-
     withVersion
 
   private val filenameExtractor: Regex = """.*<a href="([^"]+)".*""".r
@@ -99,12 +102,40 @@ object MavenCentral:
       .runFold(Seq.empty[String])(lineExtractor)
       .mapError(ParseError.apply)
 
+  extension (client: Client.type)
+    def requestWithFallback(
+                                path: Path,
+                                method: Method = Method.GET,
+                                headers: Headers = Headers.empty,
+                                content: Body = Body.empty,
+                                primaryBaseUrl: String = artifactUri,
+                                fallbackBaseUrl: String = fallbackArtifactUri
+                              )(implicit trace: Trace): ZIO[Client, Throwable, (Response, String)] =
+      def requestAndLog(baseUrl: String) =
+        val url = baseUrl + path
+        defer:
+          ZIO.log(s"$method $url").run
+          client.request(url, method, headers, content)
+            .tap:
+              response =>
+                ZIO.log(s"$method $url ${response.status}")
+            .map:
+              _ -> url
+            .run
+
+      defer:
+        requestAndLog(primaryBaseUrl)
+          .catchSomeCause:
+            case cause: Cause[Throwable] =>
+              defer:
+                ZIO.logCause(cause).run
+                requestAndLog(fallbackBaseUrl).run
+          .run
+
   def searchArtifacts(groupId: GroupId): ZIO[Client, GroupIdNotFoundError | Throwable, Seq[ArtifactId]] =
-    val url = artifactUri + artifactPath(groupId).addTrailingSlash
     defer:
-      ZIO.log(s"GET $url").run
-      val response = Client.request(url).run
-      ZIO.log(s"GET $url - ${response.status}").run
+      val path = artifactPath(groupId).addTrailingSlash
+      val (response, _) = Client.requestWithFallback(path).run
       response.status match
         case Status.NotFound =>
           ZIO.fail(GroupIdNotFoundError(groupId)).run
@@ -113,12 +144,10 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  private def getVersions(baseUrl: String, groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
-    val url = baseUrl + artifactPath(groupId, Some(ArtifactAndVersion(artifactId))).addTrailingSlash
+  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
     defer:
-      ZIO.log(s"GET $url").run
-      val response = Client.request(url).run
-      ZIO.log(s"GET $url - ${response.status}").run
+      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))).addTrailingSlash
+      val (response, _) = Client.requestWithFallback(path).run
       response.status match
         case Status.NotFound =>
           ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
@@ -127,39 +156,31 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def getVersionsWithFallback(baseUrl: String, fallbackBaseUrl: String, groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
-    getVersions(baseUrl, groupId, artifactId)
-      .catchSome:
-        case _: Throwable =>
-          getVersions(fallbackBaseUrl, groupId, artifactId)
-
-  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
-    getVersionsWithFallback(artifactUri, fallbackArtifactUri, groupId, artifactId)
-
   def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
     searchVersions(groupId, artifactId).map(_.headOption)
 
   def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, Throwable, Boolean] =
-    val url = artifactUri + artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
     defer:
-      val response = Client.request(url).run
+      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
+      val (response, _) = Client.requestWithFallback(path).run
       response.status match
         case s if s.isSuccess =>
           val body = response.body.asString.run
           // checks that the maven-metadata.xml contains the groupId
-          body.contains(s"<groupId>${groupId}</groupId>")
+          body.contains(s"<groupId>$groupId</groupId>")
         case _ =>
           false
 
   def artifactExists(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, Throwable, Boolean] =
-    val url = artifactUri + artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))).addTrailingSlash
     defer:
-      Client.request(url, Method.HEAD).run.status.isSuccess
+      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))).addTrailingSlash
+      val (response, _) = Client.requestWithFallback(path, Method.HEAD).run
+      response.status.isSuccess
 
   def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, JavadocNotFoundError | Throwable, Url] =
-    val url = artifactUri + artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-javadoc.jar"
     defer:
-      val response = Client.request(url, Method.HEAD).run
+      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-javadoc.jar"
+      val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
       response.status match
         case status if status.isSuccess =>
           Url(url)
