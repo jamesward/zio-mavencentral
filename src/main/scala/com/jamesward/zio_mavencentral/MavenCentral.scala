@@ -152,7 +152,12 @@ object MavenCentral:
         case Status.NotFound =>
           ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
         case s if s.isSuccess =>
-          responseToNames(response).run.map(Version(_)).reverse
+          responseToNames(response).run
+            .map(semverfi.Version.apply)
+            .sorted
+            .reverse
+            .map: version =>
+              Version(version.toString)
         case _ =>
           ZIO.fail(UnknownError(response)).run
 

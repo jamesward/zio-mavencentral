@@ -42,7 +42,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
 
         assertTrue(
           versions.contains("3.6.4"),
-          versions.indexOf(Version("1.10.1")) < versions.indexOf(Version("1.0.0")),
+          versions.indexOf(Version("1.12.4")) < versions.indexOf(Version("1.5.2")),
           err.isInstanceOf[GroupIdOrArtifactIdNotFoundError],
         )
     ,

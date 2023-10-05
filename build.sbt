@@ -20,6 +20,8 @@ libraryDependencies ++= Seq(
 
   "org.apache.commons" %  "commons-compress" % "1.24.0",
 
+  "de.sciss" %% "semverfi" % "0.3.0",
+
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
   "dev.zio" %% "zio-test-magnolia"  % zioVersion % Test,
