@@ -46,6 +46,12 @@ object MavenCentralSpec extends ZIOSpecDefault:
           err.isInstanceOf[GroupIdOrArtifactIdNotFoundError],
         )
     ,
+    test("searchVersions does not change versions"):
+      defer:
+        val versions = searchVersions(GroupId("io.jenkins.archetypes"), ArtifactId("archetypes-parent")).run
+        assertTrue:
+          versions.contains("1.21")
+    ,
     test("latest"):
       defer:
         assertTrue(latest(GroupId("com.jamesward"), ArtifactId("travis-central-test")).run.get == Version("0.0.15"))
