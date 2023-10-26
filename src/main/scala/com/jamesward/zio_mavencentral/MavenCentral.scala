@@ -3,7 +3,7 @@ package com.jamesward.zio_mavencentral
 import org.apache.commons.compress.archivers.ArchiveEntry
 import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream
 import zio.direct.*
-import zio.http.{Body, Client, Headers, Method, Path, Response, Status}
+import zio.http.{Body, Client, Headers, Method, Path, Request, Response, Status, URL}
 import zio.stream.ZPipeline
 import zio.{Cause, Scope, Trace, ZIO}
 
@@ -20,7 +20,7 @@ object MavenCentral:
   given CanEqual[Version, Version] = CanEqual.derived
   given CanEqual[GroupArtifact, GroupArtifact] = CanEqual.derived
   given CanEqual[GroupArtifactVersion, GroupArtifactVersion] = CanEqual.derived
-  given CanEqual[Url, Url] = CanEqual.derived
+  given CanEqual[URL, URL] = CanEqual.derived
   given CanEqual[Status, Status] = CanEqual.derived
 
   // todo: regionalize to maven central mirrors for lower latency
@@ -57,10 +57,6 @@ object MavenCentral:
     def apply(s: String): Version = s
     def unapply(s: String): Option[Version] = Some(s)
     val latest: Version = Version("latest")
-
-  opaque type Url = String
-  object Url:
-    def apply(s: String): Url = s
 
   case class ArtifactAndVersion(artifactId: ArtifactId, maybeVersion: Option[Version] = None)
   case class GroupArtifact(groupId: GroupId, artifactId: ArtifactId):
@@ -110,12 +106,14 @@ object MavenCentral:
                                 content: Body = Body.empty,
                                 primaryBaseUrl: String = artifactUri,
                                 fallbackBaseUrl: String = fallbackArtifactUri
-                              )(implicit trace: Trace): ZIO[Client, Throwable, (Response, String)] =
+                              )(implicit trace: Trace): ZIO[Client & Scope, Throwable, (Response, String)] =
       def requestAndLog(baseUrl: String) =
         val url = baseUrl + path
         defer:
           ZIO.log(s"$method $url").run
-          client.request(url, method, headers, content)
+          val requestUrl = ZIO.fromEither(zio.http.URL.decode(url)).run
+          val request = Request(zio.http.Version.Default, method, requestUrl, headers, content)
+          client.request(request)
             .tap:
               response =>
                 ZIO.log(s"$method $url ${response.status}")
@@ -132,7 +130,7 @@ object MavenCentral:
                 requestAndLog(fallbackBaseUrl).run
           .run
 
-  def searchArtifacts(groupId: GroupId): ZIO[Client, GroupIdNotFoundError | Throwable, Seq[ArtifactId]] =
+  def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError | Throwable, Seq[ArtifactId]] =
     defer:
       val path = artifactPath(groupId).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path).run
@@ -144,7 +142,7 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
+  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path).run
@@ -159,10 +157,10 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
+  def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
     searchVersions(groupId, artifactId).map(_.headOption)
 
-  def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, Throwable, Boolean] =
+  def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, Throwable, Boolean] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
       val (response, _) = Client.requestWithFallback(path).run
@@ -174,19 +172,19 @@ object MavenCentral:
         case _ =>
           false
 
-  def artifactExists(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, Throwable, Boolean] =
+  def artifactExists(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, Throwable, Boolean] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path, Method.HEAD).run
       response.status.isSuccess
 
-  def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, JavadocNotFoundError | Throwable, Url] =
+  def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, JavadocNotFoundError | Throwable, URL] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-javadoc.jar"
       val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
       response.status match
         case status if status.isSuccess =>
-          Url(url)
+          ZIO.fromEither(URL.decode(url)).run
         case Status.NotFound =>
           ZIO.fail(JavadocNotFoundError(groupId, artifactId, version)).run
         case _ =>
@@ -195,9 +193,10 @@ object MavenCentral:
   // todo: this is terrible
   //       zip handling via zio?
   //       what about file locking
-  def downloadAndExtractZip(source: Url, destination: File): ZIO[Client, Throwable, Unit] =
+  def downloadAndExtractZip(source: URL, destination: File): ZIO[Client & Scope, Throwable, Unit] =
     defer:
-      val response = Client.request(source).run
+      val request = Request.get(source)
+      val response = Client.request(request).run
       if response.status.isError then
         ZIO.fail(UnknownError(response)).run
       else

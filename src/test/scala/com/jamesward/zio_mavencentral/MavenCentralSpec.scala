@@ -3,8 +3,9 @@ package com.jamesward.zio_mavencentral
 import MavenCentral.{*, given}
 import zio.*
 import zio.direct.*
-import zio.http.{Client, Path}
+import zio.http.{Client, Path, URL}
 import zio.test.*
+import zio.test.Assertion.isTrue
 
 import java.nio.file.Files
 
@@ -78,18 +79,23 @@ object MavenCentralSpec extends ZIOSpecDefault:
 
         assertTrue(
           doesNotExist == Exit.fail(JavadocNotFoundError(GroupId("com.jamesward"), ArtifactId("travis-central-test"), Version("0.0.15"))),
-          doesExist == Url("https://repo1.maven.org/maven2/org/webjars/webjars-locator-core/0.52/webjars-locator-core-0.52-javadoc.jar"),
+          URL.decode("https://repo1.maven.org/maven2/org/webjars/webjars-locator-core/0.52/webjars-locator-core-0.52-javadoc.jar").contains(doesExist),
         )
     ,
     test("downloadAndExtractZip"):
-      val url = Url("https://repo1.maven.org/maven2/com/jamesward/travis-central-test/0.0.15/travis-central-test-0.0.15.jar")
+      val url = URL.decode("https://repo1.maven.org/maven2/com/jamesward/travis-central-test/0.0.15/travis-central-test-0.0.15.jar").toOption.get
       val tmpFile = Files.createTempDirectory("test").nn.toFile.nn
       downloadAndExtractZip(url, tmpFile).as(assertTrue(tmpFile.list().nn.contains("META-INF")))
     ,
+    // note that on some networks all DNS requests are accepted and redirect to something like a captive portal, wtf
     test("requestWithFallbackurl"):
       val artifactUrl = "https://zxcvasdf123124zxcv.com/"
       val fallbackArtifactUrl = "https://repo1.maven.org/maven2/"
-      defer:
-        val (response, _) = Client.requestWithFallback(Path.decode("com/jamesward/maven-metadata.xml"), primaryBaseUrl = artifactUrl, fallbackBaseUrl = fallbackArtifactUrl).run
-        assertTrue(response.status.isSuccess)
-  ).provide(Client.default)
+      // bug in zio-direct:
+      // assertTrue(response.status.isSuccess)
+      // Exception occurred while executing macro expansion.
+      // java.lang.Exception: Expected an expression. This is a partially applied Term. Try eta-expanding the term first.
+      Client.requestWithFallback(Path.decode("com/jamesward/maven-metadata.xml"), primaryBaseUrl = artifactUrl, fallbackBaseUrl = fallbackArtifactUrl).map:
+        (response, _) =>
+          assert(response.status.isSuccess)(isTrue)
+  ).provide(Client.default, Scope.default)
