@@ -10,7 +10,7 @@ scalacOptions ++= Seq(
   "-Xfatal-warnings",
 )
 
-val zioVersion = "2.0.19"
+val zioVersion = "2.0.21"
 
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                % zioVersion,
