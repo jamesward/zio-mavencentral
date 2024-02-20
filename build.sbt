@@ -18,7 +18,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-direct-streams" % "1.0.0-RC7",
   "dev.zio" %% "zio-http"           % "3.0.0-RC4",
 
-  "org.apache.commons" %  "commons-compress" % "1.25.0",
+  "org.apache.commons" %  "commons-compress" % "1.26.0",
 
   "de.sciss" %% "semverfi" % "0.3.0",
 
