@@ -13,7 +13,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
 
   given CanEqual[String, String] = CanEqual.derived
   given CanEqual[Seq[MavenCentral.ArtifactId], Seq[MavenCentral.ArtifactId]] = CanEqual.derived
-  given CanEqual[Exit[MavenCentral.JavadocNotFoundError | Throwable, _], Exit[MavenCentral.JavadocNotFoundError | Throwable, _]] = CanEqual.derived
+  given CanEqual[Exit[MavenCentral.JavadocNotFoundError | Throwable, ?], Exit[MavenCentral.JavadocNotFoundError | Throwable, ?]] = CanEqual.derived
 
   def spec = suite("MavenCentral")(
     test("artifactPath"):
