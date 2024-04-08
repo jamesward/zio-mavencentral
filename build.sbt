@@ -19,7 +19,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-schema-json"     % "1.0.1",
   "dev.zio" %% "zio-schema-protobuf" % "1.0.1",
   "dev.zio" %% "zio-schema"          % "1.0.1",
-  "dev.zio" %% "zio-http"            % "3.0.0-RC5",
+  "dev.zio" %% "zio-http"            % "3.0.0-RC6",
 
   "org.apache.commons" %  "commons-compress" % "1.26.1",
 
