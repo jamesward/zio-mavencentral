@@ -2,7 +2,7 @@ organization := "com.jamesward"
 
 name := "zio-mavencentral"
 
-scalaVersion := "3.4.0"
+scalaVersion := "3.4.1"
 
 scalacOptions ++= Seq(
   "-Yexplicit-nulls",
@@ -16,10 +16,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                 % zioVersion,
   "dev.zio" %% "zio-direct"          % "1.0.0-RC7",
   "dev.zio" %% "zio-direct-streams"  % "1.0.0-RC7",
-  "dev.zio" %% "zio-schema-json"     % "1.0.1",
-  "dev.zio" %% "zio-schema-protobuf" % "1.0.1",
-  "dev.zio" %% "zio-schema"          % "1.0.1",
-  "dev.zio" %% "zio-http"            % "3.0.0-RC5",
+  "dev.zio" %% "zio-http"            % "3.0.0-RC6",
 
   "org.apache.commons" %  "commons-compress" % "1.26.1",
 
