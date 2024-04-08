@@ -16,9 +16,9 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                 % zioVersion,
   "dev.zio" %% "zio-direct"          % "1.0.0-RC7",
   "dev.zio" %% "zio-direct-streams"  % "1.0.0-RC7",
-  "dev.zio" %% "zio-schema-json"     % "1.0.1",
-  "dev.zio" %% "zio-schema-protobuf" % "1.0.1",
-  "dev.zio" %% "zio-schema"          % "1.0.1",
+  "dev.zio" %% "zio-schema-json"     % "1.1.0",
+  "dev.zio" %% "zio-schema-protobuf" % "1.1.0",
+  "dev.zio" %% "zio-schema"          % "1.1.0",
   "dev.zio" %% "zio-http"            % "3.0.0-RC5",
 
   "org.apache.commons" %  "commons-compress" % "1.26.1",
