@@ -5,7 +5,6 @@ import zio.*
 import zio.direct.*
 import zio.http.{Client, Path, URL}
 import zio.test.*
-import zio.test.Assertion.isTrue
 
 import java.nio.file.Files
 
@@ -97,5 +96,5 @@ object MavenCentralSpec extends ZIOSpecDefault:
       // java.lang.Exception: Expected an expression. This is a partially applied Term. Try eta-expanding the term first.
       Client.requestWithFallback(Path.decode("com/jamesward/maven-metadata.xml"), primaryBaseUrl = artifactUrl, fallbackBaseUrl = fallbackArtifactUrl).map:
         (response, _) =>
-          assert(response.status.isSuccess)(isTrue)
+          assertTrue(response.status.isSuccess)
   ).provide(Client.default, Scope.default)
