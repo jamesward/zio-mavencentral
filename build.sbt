@@ -47,3 +47,5 @@ developers := List(
 )
 
 ThisBuild / sonatypeCredentialHost := xerial.sbt.Sonatype.sonatypeCentralHost
+
+ThisBuild / versionScheme := Some("semver-spec")
