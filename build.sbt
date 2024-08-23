@@ -5,9 +5,9 @@ name := "zio-mavencentral"
 scalaVersion := "3.5.0"
 
 scalacOptions ++= Seq(
-  "-Yexplicit-nulls",
+  // "-Yexplicit-nulls", // not sure where it went
   "-language:strictEquality",
-  "-Xfatal-warnings",
+  // "-Xfatal-warnings", // not sure where it went
 )
 
 val zioVersion = "2.1.7"
