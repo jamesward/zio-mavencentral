@@ -45,3 +45,5 @@ developers := List(
     url("https://jamesward.com")
   )
 )
+
+ThisBuild / sonatypeCredentialHost := xerial.sbt.Sonatype.sonatypeCentralHost
