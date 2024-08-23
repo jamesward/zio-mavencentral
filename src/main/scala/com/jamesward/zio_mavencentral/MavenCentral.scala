@@ -33,11 +33,6 @@ object MavenCentral:
   case class UnknownError(response: Response) extends Throwable
   case class ParseError(t: Throwable) extends Throwable
 
-  extension (path: Path)
-    @targetName("slash")
-    @unused
-    def /(version: Version): Path = path / version
-
   opaque type GroupId = String
   object GroupId:
     def apply(s: String): GroupId = s
