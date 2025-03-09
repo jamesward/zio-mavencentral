@@ -108,7 +108,7 @@ object MavenCentral:
           ZIO.log(s"$method $url").run
           val requestUrl = ZIO.fromEither(zio.http.URL.decode(url)).run
           val request = Request(zio.http.Version.Default, method, requestUrl, headers, content)
-          client.request(request)
+          client.batched(request)
             .tap:
               response =>
                 ZIO.log(s"$method $url ${response.status}")
@@ -191,7 +191,7 @@ object MavenCentral:
   def downloadAndExtractZip(source: URL, destination: File): ZIO[Client & Scope, Throwable, Unit] =
     defer:
       val request = Request.get(source)
-      val response = Client.request(request).run
+      val response = Client.batched(request).run
       if response.status.isError then
         ZIO.fail(UnknownError(response)).run
       else
