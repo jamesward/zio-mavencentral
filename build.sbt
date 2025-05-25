@@ -18,6 +18,8 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-direct-streams"  % "1.0.0-RC7",
   "dev.zio" %% "zio-http"            % "3.3.0",
 
+  "org.scala-lang.modules" %% "scala-xml" % "2.3.0",
+
   "org.apache.commons" %  "commons-compress" % "1.27.1",
 
   "de.sciss" %% "semverfi" % "0.3.0",
@@ -45,7 +47,5 @@ developers := List(
     url("https://jamesward.com")
   )
 )
-
-ThisBuild / sonatypeCredentialHost := xerial.sbt.Sonatype.sonatypeCentralHost
 
 ThisBuild / versionScheme := Some("semver-spec")
