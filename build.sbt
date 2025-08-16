@@ -20,7 +20,7 @@ libraryDependencies ++= Seq(
 
   "org.scala-lang.modules" %% "scala-xml" % "2.4.0",
 
-  "org.apache.commons" %  "commons-compress" % "1.27.1",
+  "org.apache.commons" %  "commons-compress" % "1.28.0",
 
   "de.sciss" %% "semverfi" % "0.3.0",
 
