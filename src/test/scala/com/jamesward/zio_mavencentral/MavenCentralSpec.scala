@@ -30,7 +30,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
 
         assertTrue(
           webjarArtifacts.size > 1000,
-          webjarArtifacts == webjarArtifacts.sorted(CaseInsensitiveOrdering),
+          webjarArtifacts == webjarArtifacts.sorted(using CaseInsensitiveOrdering),
           springdataArtifacts.size > 10,
           err.isInstanceOf[GroupIdNotFoundError],
         )

@@ -133,7 +133,7 @@ object MavenCentral:
         case Status.NotFound =>
           ZIO.fail(GroupIdNotFoundError(groupId)).run
         case s if s.isSuccess =>
-          responseToNames(response).run.map(ArtifactId(_)).sorted(CaseInsensitiveOrdering)
+          responseToNames(response).run.map(ArtifactId(_)).sorted(using CaseInsensitiveOrdering)
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
