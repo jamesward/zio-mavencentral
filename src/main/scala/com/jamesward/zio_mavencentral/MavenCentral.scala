@@ -30,8 +30,6 @@ object MavenCentral:
   case class GroupIdNotFoundError(groupId: GroupId)
   case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
   case class JavadocNotFoundError(groupId: GroupId, artifactId: ArtifactId, version: Version)
-  case class UnknownError(response: Response) extends Throwable
-  case class ParseError(t: Throwable) extends Throwable
 
   opaque type GroupId = String
   object GroupId:
@@ -87,11 +85,11 @@ object MavenCentral:
       case _ =>
         names
 
-  private def responseToNames(response: Response): ZIO[Any, ParseError, Seq[String]] =
+  private def responseToNames(response: Response): ZIO[Any, Nothing, Seq[String]] =
     response.body.asStream
       .via(ZPipeline.utf8Decode >>> ZPipeline.splitLines)
       .runFold(Seq.empty[String])(lineExtractor)
-      .mapError(ParseError.apply)
+      .orDie
 
   extension (client: Client.type)
     def requestWithFallback(
@@ -101,7 +99,7 @@ object MavenCentral:
                                 content: Body = Body.empty,
                                 primaryBaseUrl: String = artifactUri,
                                 fallbackBaseUrl: String = fallbackArtifactUri
-                              )(implicit trace: Trace): ZIO[Client & Scope, Throwable, (Response, String)] =
+                              )(implicit trace: Trace): ZIO[Client & Scope, Nothing, (Response, String)] =
       def requestAndLog(baseUrl: String) =
         val url = baseUrl + path
         defer:
@@ -116,16 +114,11 @@ object MavenCentral:
               _ -> url
             .run
 
-      defer:
-        requestAndLog(primaryBaseUrl)
-          .catchSomeCause:
-            case cause: Cause[Throwable] =>
-              defer:
-                ZIO.logCause(cause).run
-                requestAndLog(fallbackBaseUrl).run
-          .run
+      requestAndLog(primaryBaseUrl)
+        .orElse(requestAndLog(fallbackBaseUrl))
+        .orDie
 
-  def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError | Throwable, Seq[ArtifactId]] =
+  def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError, Seq[ArtifactId]] =
     defer:
       val path = artifactPath(groupId).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path).run
@@ -135,9 +128,11 @@ object MavenCentral:
         case s if s.isSuccess =>
           responseToNames(response).run.map(ArtifactId(_)).sorted(using CaseInsensitiveOrdering)
         case _ =>
-          ZIO.fail(UnknownError(response)).run
+          val body = response.body.asString.orDie.run
+          ZIO.dieMessage(body).run
 
-  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
+
+  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError, Seq[Version]] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path).run
@@ -150,58 +145,61 @@ object MavenCentral:
             .reverse
             .map(Version(_))
         case _ =>
-          ZIO.fail(UnknownError(response)).run
+          val body = response.body.asString.orDie.run
+          ZIO.dieMessage(body).run
 
-  def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
+  def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError, Option[Version]] =
     searchVersions(groupId, artifactId).map(_.headOption)
 
-  def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, Throwable, Boolean] =
+  def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, Nothing, Boolean] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
       val (response, _) = Client.requestWithFallback(path).run
       response.status match
         case s if s.isSuccess =>
-          val body = response.body.asString.run
+          val body = response.body.asString.orDie.run
           // checks that the maven-metadata.xml contains the groupId
           body.contains(s"<groupId>$groupId</groupId>")
         case _ =>
           false
 
-  def artifactExists(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, Throwable, Boolean] =
+  def artifactExists(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, Nothing, Boolean] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path, Method.HEAD).run
       response.status.isSuccess
 
-  def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, JavadocNotFoundError | Throwable, URL] =
+  def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, JavadocNotFoundError, URL] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-javadoc.jar"
       val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
       response.status match
         case status if status.isSuccess =>
-          ZIO.fromEither(URL.decode(url)).run
+          ZIO.fromEither(URL.decode(url)).orDie.run
         case Status.NotFound =>
           ZIO.fail(JavadocNotFoundError(groupId, artifactId, version)).run
         case _ =>
-          ZIO.fail(UnknownError(response)).run
+          val body = response.body.asString.orDie.run
+          ZIO.dieMessage(body).run
 
   // todo: this is terrible
   //       zip handling via zio?
   //       what about file locking
-  def downloadAndExtractZip(source: URL, destination: File): ZIO[Client & Scope, Throwable, Unit] =
+  def downloadAndExtractZip(source: URL, destination: File): ZIO[Client & Scope, Nothing, Unit] =
     defer:
       val request = Request.get(source)
-      val response = Client.batched(request).run
-      if response.status.isError then
-        ZIO.fail(UnknownError(response)).run
-      else
+      val response = Client.batched(request).orDie.run
+      if response.status.isError then {
+        val body = response.body.asString.orDie.run
+        ZIO.dieMessage(body).run
+      } else
         run:
           ZIO.scoped:
             defer:
               val zipArchiveInputStream =
                 run:
                   ZIO.fromAutoCloseable:
-                    response.body.asStream.toInputStream.map(ZipArchiveInputStream(_))
+                    response.body.asStream.orDie.toInputStream.map(ZipArchiveInputStream(_))
 
               LazyList
                 .continually(zipArchiveInputStream.getNextEntry)
