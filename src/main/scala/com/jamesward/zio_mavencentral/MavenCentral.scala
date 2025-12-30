@@ -1,14 +1,14 @@
 package com.jamesward.zio_mavencentral
 
-import org.apache.commons.compress.archivers.ArchiveEntry
-import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream
+import zio.compress.{ArchiveEntry, ZipUnarchiver}
 import zio.direct.*
-import zio.http.{Body, Client, Headers, Method, Path, Request, Response, Status, URL}
-import zio.stream.ZPipeline
+import zio.http.*
+import zio.stream.{ZPipeline, ZSink, ZStream}
 import zio.{Cause, Scope, Trace, ZIO}
 
-import java.io.File
+import java.io.{File, IOException}
 import java.nio.file.Files
+import java.util.zip.ZipEntry
 import scala.annotation.{targetName, unused}
 import scala.util.matching.Regex
 
@@ -185,9 +185,7 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  // todo: this is terrible
-  //       zip handling via zio?
-  //       what about file locking
+  // what about file locking?
   def downloadAndExtractZip(source: URL, destination: File): ZIO[Client & Scope, Throwable, Unit] =
     defer:
       val request = Request.get(source)
@@ -195,25 +193,14 @@ object MavenCentral:
       if response.status.isError then
         ZIO.fail(UnknownError(response)).run
       else
-        run:
-          ZIO.scoped:
-            defer:
-              val zipArchiveInputStream =
-                run:
-                  ZIO.fromAutoCloseable:
-                    response.body.asStream.toInputStream.map(ZipArchiveInputStream(_))
+        val sink = ZSink.foreach[Any, Throwable, (ArchiveEntry[Option, ZipEntry], ZStream[Any, IOException, Byte])]:
+          case (entry, contentStream) =>
+            val targetPath = destination.toPath.resolve(entry.name)
 
-              LazyList
-                .continually(zipArchiveInputStream.getNextEntry)
-                .takeWhile:
-                  case _: ArchiveEntry => true
-                  case _ => false
+            if entry.isDirectory then
+              ZIO.attemptBlockingIO(Files.createDirectories(targetPath))
+            else
+              ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
+                contentStream.run(ZSink.fromPath(targetPath))
 
-                .foreach: ze =>
-                  val tmpFile = File(destination, ze.nn.getName)
-                  if (ze.nn.isDirectory)
-                    tmpFile.mkdirs()
-                  else
-                    if (!tmpFile.getParentFile.nn.exists())
-                      tmpFile.getParentFile.nn.mkdirs()
-                    Files.copy(zipArchiveInputStream, tmpFile.toPath)
+        response.body.asStream.via(ZipUnarchiver.unarchive).run(sink).unit.run

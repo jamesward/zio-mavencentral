@@ -17,10 +17,9 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-direct"          % "1.0.0-RC7",
   "dev.zio" %% "zio-direct-streams"  % "1.0.0-RC7",
   "dev.zio" %% "zio-http"            % "3.7.4",
+  "dev.zio" %% "zio-streams-compress-zip" % "1.1.3",
 
   "org.scala-lang.modules" %% "scala-xml" % "2.4.0",
-
-  "org.apache.commons" %  "commons-compress" % "1.28.0",
 
   "de.sciss" %% "semverfi" % "0.3.0",
 
