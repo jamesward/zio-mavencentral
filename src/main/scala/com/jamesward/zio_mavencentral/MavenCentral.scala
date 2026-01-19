@@ -1,10 +1,12 @@
 package com.jamesward.zio_mavencentral
 
+import io.netty.handler.codec.base64.Base64
 import zio.compress.{ArchiveEntry, ZipUnarchiver}
 import zio.direct.*
 import zio.http.*
+import zio.schema.{Schema, derived}
 import zio.stream.{ZPipeline, ZSink, ZStream}
-import zio.{Cause, Scope, Trace, ZIO}
+import zio.{Cause, Chunk, Scope, Trace, ZIO, ZLayer}
 
 import java.io.{File, IOException}
 import java.nio.file.Files
@@ -204,3 +206,89 @@ object MavenCentral:
                 contentStream.run(ZSink.fromPath(targetPath))
 
         response.body.asStream.via(ZipUnarchiver.unarchive).run(sink).unit.run
+
+  object Deploy:
+    import zio.http.Header.Authorization
+
+    // would be nice to just type alias but then results in Ambiguous layers
+    case class Sonatype(client: Client)
+
+    object Sonatype:
+      private val sonatypeUrl = URL.decode("https://central.sonatype.com").getOrElse(throw new RuntimeException("invalid inference url"))
+
+      extension (s: String) def base64: String = java.util.Base64.getEncoder.encodeToString(s.getBytes)
+
+      def clientMiddleware(username: String, password: String)(client: Client): Client =
+        val token = s"$username:$password".base64
+
+        client
+          .addHeader(Authorization.Bearer(token = token))
+          .url(sonatypeUrl)
+          .mapZIO:
+            response =>
+              if response.status.isSuccess then
+                ZIO.succeed(response)
+              else
+                response.body.asString.flatMap:
+                  body =>
+                    ZIO.fail(IllegalStateException(s"Sonatype request failed ${response.status} : $body"))
+        @@ ZClientAspect.requestLogging()
+
+      val Live: ZLayer[Client, Throwable, Sonatype] =
+        ZLayer.fromZIO:
+          defer:
+            val username = ZIO.systemWith(_.env("OSS_DEPLOY_USERNAME")).someOrFail(new RuntimeException("OSS_DEPLOY_USERNAME env var not set")).run
+            val password = ZIO.systemWith(_.env("OSS_DEPLOY_PASSWORD")).someOrFail(new RuntimeException("OSS_DEPLOY_PASSWORD env var not set")).run
+            val client = ZIO.serviceWith[Client](clientMiddleware(username, password)).run
+            Sonatype(client)
+
+    type DeploymentId = String
+
+    given CanEqual[DeploymentState, DeploymentState] = CanEqual.derived
+
+    enum DeploymentState:
+      case FAILED, PENDING, PUBLISHED, PUBLISHING, VALIDATED, VALIDATING
+      def isFinal: Boolean = this == FAILED || this == PUBLISHED || this == VALIDATED
+
+
+    def upload(filename: String, zip: Array[Byte]): ZIO[Sonatype, Throwable, DeploymentId] =
+      ZIO.serviceWithZIO[Sonatype]:
+        sonatype =>
+          ZIO.scoped:
+            defer:
+              val body = Body.fromMultipartFormUUID(
+                Form(
+                  FormField.binaryField(
+                    "bundle",
+                    Chunk.fromArray(zip),
+                    MediaType.application.`octet-stream`,
+                    filename = Some(filename),
+                  )
+                )
+              ).run
+              val response = sonatype.client.post("/api/v1/publisher/upload")(body).run
+              response.body.asString.run
+
+    case class StatusResponse(deploymentState: DeploymentState) derives Schema
+
+    def checkStatus(deploymentId: DeploymentId): ZIO[Sonatype, Throwable, DeploymentState] =
+      ZIO.serviceWithZIO[Sonatype]:
+        sonatype =>
+          ZIO.scoped:
+            defer:
+              val response = sonatype.client.post(s"/api/v1/publisher/status?id=$deploymentId")(Body.empty).run
+              val statusResponse = response.body.asJson[StatusResponse].run
+              statusResponse.deploymentState
+
+    def publish(deploymentId: DeploymentId): ZIO[Sonatype, Throwable, Unit] =
+      ZIO.serviceWithZIO[Sonatype]:
+        sonatype =>
+          ZIO.scoped:
+            sonatype.client.post(s"/api/v1/publisher/deployment/$deploymentId")(Body.empty).unit
+            // todo: check that the response status is 204
+
+    def drop(deploymentId: DeploymentId): ZIO[Sonatype, Throwable, Unit] =
+      ZIO.serviceWithZIO[Sonatype]:
+        sonatype =>
+          ZIO.scoped:
+            sonatype.client.delete(s"/api/v1/publisher/deployment/$deploymentId").unit

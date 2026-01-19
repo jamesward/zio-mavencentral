@@ -18,6 +18,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-direct-streams"  % "1.0.0-RC7",
   "dev.zio" %% "zio-http"            % "3.7.4",
   "dev.zio" %% "zio-streams-compress-zip" % "1.1.3",
+  "dev.zio" %% "zio-schema-derivation" % "1.7.6",
 
   "org.scala-lang.modules" %% "scala-xml" % "2.4.0",
 
