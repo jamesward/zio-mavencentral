@@ -1,12 +1,11 @@
 package com.jamesward.zio_mavencentral
 
-import io.netty.handler.codec.base64.Base64
 import zio.compress.{ArchiveEntry, ZipUnarchiver}
 import zio.direct.*
 import zio.http.*
 import zio.schema.{Schema, derived}
 import zio.stream.{ZPipeline, ZSink, ZStream}
-import zio.{Cause, Chunk, Scope, Trace, ZIO, ZLayer}
+import zio.{Cause, Chunk, Schedule, Scope, Trace, ZIO, ZLayer, durationInt}
 
 import java.io.{File, IOException}
 import java.nio.file.Files
@@ -16,24 +15,10 @@ import scala.util.matching.Regex
 
 object MavenCentral:
 
-  given CanEqual[Path, Path] = CanEqual.derived
-  given CanEqual[GroupId, GroupId] = CanEqual.derived
-  given CanEqual[ArtifactId, ArtifactId] = CanEqual.derived
-  given CanEqual[Version, Version] = CanEqual.derived
-  given CanEqual[GroupArtifact, GroupArtifact] = CanEqual.derived
-  given CanEqual[GroupArtifactVersion, GroupArtifactVersion] = CanEqual.derived
-  given CanEqual[URL, URL] = CanEqual.derived
-  given CanEqual[Status, Status] = CanEqual.derived
-
   // todo: regionalize to maven central mirrors for lower latency
   private val artifactUri = "https://repo1.maven.org/maven2/"
   private val fallbackArtifactUri = "https://repo.maven.apache.org/maven2/"
 
-  case class GroupIdNotFoundError(groupId: GroupId)
-  case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
-  case class JavadocNotFoundError(groupId: GroupId, artifactId: ArtifactId, version: Version)
-  case class UnknownError(response: Response) extends Throwable
-  case class ParseError(t: Throwable) extends Throwable
 
   opaque type GroupId = String
   object GroupId:
@@ -69,6 +54,35 @@ object MavenCentral:
     @unused
     lazy val toPath: Path = groupId / artifactId / version
     override def toString: String = s"$groupId/$artifactId/$version"
+
+
+  case class GroupIdNotFoundError(groupId: GroupId)
+  case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
+  case class JavadocNotFoundError(groupId: GroupId, artifactId: ArtifactId, version: Version)
+  case class UnknownError(response: Response) extends Throwable
+  case class ParseError(t: Throwable) extends Throwable
+
+  given Schema[GroupId] = Schema.primitive[String].transform(MavenCentral.GroupId.apply, _.toString)
+  given Schema[ArtifactId] = Schema.primitive[String].transform(MavenCentral.ArtifactId.apply, _.toString)
+  given Schema[Version] = Schema.primitive[String].transform(MavenCentral.Version.apply, _.toString)
+
+  def stringToGroupArtifact(s: String): MavenCentral.GroupArtifact =
+    // todo: parse failure handling
+    val parts = s.split(':')
+    MavenCentral.GroupArtifact(MavenCentral.GroupId(parts(0)), MavenCentral.ArtifactId(parts(1)))
+
+  def groupArtifactToString(ga: MavenCentral.GroupArtifact): String = s"${ga.groupId}:${ga.artifactId}"
+
+  given Schema[MavenCentral.GroupArtifact] = Schema.primitive[String].transform(stringToGroupArtifact, groupArtifactToString)
+
+  given CanEqual[Path, Path] = CanEqual.derived
+  given CanEqual[GroupId, GroupId] = CanEqual.derived
+  given CanEqual[ArtifactId, ArtifactId] = CanEqual.derived
+  given CanEqual[Version, Version] = CanEqual.derived
+  given CanEqual[GroupArtifact, GroupArtifact] = CanEqual.derived
+  given CanEqual[GroupArtifactVersion, GroupArtifactVersion] = CanEqual.derived
+  given CanEqual[URL, URL] = CanEqual.derived
+  given CanEqual[Status, Status] = CanEqual.derived
 
 
   object CaseInsensitiveOrdering extends Ordering[ArtifactId]:
@@ -214,7 +228,7 @@ object MavenCentral:
     case class Sonatype(client: Client)
 
     object Sonatype:
-      private val sonatypeUrl = URL.decode("https://central.sonatype.com").getOrElse(throw new RuntimeException("invalid inference url"))
+      private val sonatypeUrl = URL.decode("https://central.sonatype.com").toOption.get
 
       extension (s: String) def base64: String = java.util.Base64.getEncoder.encodeToString(s.getBytes)
 
@@ -292,3 +306,22 @@ object MavenCentral:
         sonatype =>
           ZIO.scoped:
             sonatype.client.delete(s"/api/v1/publisher/deployment/$deploymentId").unit
+
+    def uploadVerifyAndPublish(filename: String, zip: Array[Byte]): ZIO[Sonatype, Throwable, Unit] =
+      ZIO.serviceWithZIO[Sonatype]:
+        sonatype =>
+          ZIO.scoped:
+            defer:
+              val deploymentId = MavenCentral.Deploy.upload(filename, zip).run
+
+              val status = MavenCentral.Deploy.checkStatus(deploymentId)
+                .filterOrFail(_.isFinal)(IllegalStateException("Waiting on final deployment status")) // todo: add current state to error
+                .retry(Schedule.exponential(1.second))
+                .timeout(5.minutes)
+                .someOrFail(RuntimeException("Timed out waiting for deployment to finish processing"))
+                .run
+
+              if status == DeploymentState.VALIDATED then
+                MavenCentral.Deploy.publish(deploymentId).run
+              else
+                ZIO.fail(RuntimeException(s"Deployment failed with status $status")).run
