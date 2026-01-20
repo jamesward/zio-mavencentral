@@ -7,6 +7,7 @@ import zio.http.{Client, Path, URL}
 import zio.test.*
 
 import java.nio.file.Files
+import java.time.ZonedDateTime
 
 object MavenCentralSpec extends ZIOSpecDefault:
 
@@ -26,8 +27,8 @@ object MavenCentralSpec extends ZIOSpecDefault:
       ,
       test("searchArtifacts"):
         defer:
-          val webjarArtifacts = searchArtifacts(GroupId("org.webjars")).run
-          val springdataArtifacts = searchArtifacts(GroupId("org.springframework.data")).run
+          val webjarArtifacts = searchArtifacts(GroupId("org.webjars")).run.items
+          val springdataArtifacts = searchArtifacts(GroupId("org.springframework.data")).run.items
           val err = searchArtifacts(GroupId("zxcv12313asdf")).flip.run
 
           assertTrue(
@@ -39,7 +40,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
       ,
       test("searchVersions"):
         defer:
-          val versions = searchVersions(GroupId("org.webjars"), ArtifactId("jquery")).run
+          val versions = searchVersions(GroupId("org.webjars"), ArtifactId("jquery")).run.items
           val err = searchVersions(GroupId("com.jamesward"), ArtifactId("zxcvasdf")).flip.run
 
           assertTrue(
@@ -50,9 +51,37 @@ object MavenCentralSpec extends ZIOSpecDefault:
       ,
       test("searchVersions does not change versions"):
         defer:
-          val versions = searchVersions(GroupId("io.jenkins.archetypes"), ArtifactId("archetypes-parent")).run
+          val versions = searchVersions(GroupId("io.jenkins.archetypes"), ArtifactId("archetypes-parent")).run.items
           assertTrue:
             versions.contains("1.21")
+      ,
+      test("isModifiedSince groupId"):
+        defer:
+          val artifacts = searchArtifacts(GroupId("org.webjars")).run
+          val lastModified = artifacts.maybeLastModified.get
+
+          val isModifiedSinceLastModified = isModifiedSince(lastModified, GroupId("org.webjars")).run
+
+          val isModifiedSinceLongAgo = isModifiedSince(ZonedDateTime.now().minusYears(10), GroupId("org.webjars")).run
+
+          assertTrue(
+            !isModifiedSinceLastModified,
+            isModifiedSinceLongAgo
+          )
+      ,
+      test("isModifiedSince artifactId"):
+        defer:
+          val versions = searchVersions(GroupId("org.webjars"), ArtifactId("bootstrap")).run
+          val lastModified = versions.maybeLastModified.get
+
+          val isModifiedSinceLastModified = isModifiedSince(lastModified, GroupId("org.webjars"), Some(ArtifactId("bootstrap"))).run
+
+          val isModifiedSinceLongAgo = isModifiedSince(ZonedDateTime.now().minusYears(10), GroupId("org.webjars"), Some(ArtifactId("bootstrap"))).run
+
+          assertTrue(
+            !isModifiedSinceLastModified,
+            isModifiedSinceLongAgo
+          )
       ,
       test("latest"):
         defer:

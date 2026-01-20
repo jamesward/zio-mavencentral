@@ -9,6 +9,7 @@ import zio.{Cause, Chunk, Schedule, Scope, Trace, ZIO, ZLayer, durationInt}
 
 import java.io.{File, IOException}
 import java.nio.file.Files
+import java.time.ZonedDateTime
 import java.util.zip.ZipEntry
 import scala.annotation.{targetName, unused}
 import scala.util.matching.Regex
@@ -55,6 +56,7 @@ object MavenCentral:
     lazy val toPath: Path = groupId / artifactId / version
     override def toString: String = s"$groupId/$artifactId/$version"
 
+  case class SeqWithLastModified[A](items: Seq[A], maybeLastModified: Option[ZonedDateTime])
 
   case class GroupIdNotFoundError(groupId: GroupId)
   case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
@@ -141,7 +143,7 @@ object MavenCentral:
                 requestAndLog(fallbackBaseUrl).run
           .run
 
-  def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError | Throwable, Seq[ArtifactId]] =
+  def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError | Throwable, SeqWithLastModified[ArtifactId]] =
     defer:
       val path = artifactPath(groupId).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path).run
@@ -149,11 +151,14 @@ object MavenCentral:
         case Status.NotFound =>
           ZIO.fail(GroupIdNotFoundError(groupId)).run
         case s if s.isSuccess =>
-          responseToNames(response).run.map(ArtifactId(_)).sorted(using CaseInsensitiveOrdering)
+          SeqWithLastModified(
+            responseToNames(response).run.map(ArtifactId(_)).sorted(using CaseInsensitiveOrdering),
+            response.header(Header.LastModified).map(_.value)
+          )
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Seq[Version]] =
+  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, SeqWithLastModified[Version]] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path).run
@@ -161,15 +166,29 @@ object MavenCentral:
         case Status.NotFound =>
           ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
         case s if s.isSuccess =>
-          responseToNames(response).run
-            .sortBy(semverfi.Version(_))
-            .reverse
-            .map(Version(_))
+          SeqWithLastModified(
+            responseToNames(response).run
+              .sortBy(semverfi.Version(_))
+              .reverse
+              .map(Version(_)),
+            response.header(Header.LastModified).map(_.value)
+          )
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
+  def isModifiedSince(dateTime: ZonedDateTime, groupId: GroupId, maybeArtifactId: Option[ArtifactId] = None):
+    ZIO[Client & Scope, GroupIdNotFoundError | GroupIdOrArtifactIdNotFoundError | Throwable, Boolean] =
+      defer:
+        val path = artifactPath(groupId, maybeArtifactId.map(ArtifactAndVersion(_))).addTrailingSlash
+        val (response, _) = Client.requestWithFallback(path, Method.HEAD, Headers(Header.IfModifiedSince(dateTime))).run
+        response.status match
+          case Status.Ok => ZIO.succeed(true).run
+          case Status.NotModified => ZIO.succeed(false).run
+          case Status.NotFound => ZIO.fail(maybeArtifactId.fold(GroupIdNotFoundError(groupId))(GroupIdOrArtifactIdNotFoundError(groupId, _))).run
+          case e => ZIO.fail(UnknownError(response)).run
+
   def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
-    searchVersions(groupId, artifactId).map(_.headOption)
+    searchVersions(groupId, artifactId).map(_.items.headOption)
 
   def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, Throwable, Boolean] =
     defer:
