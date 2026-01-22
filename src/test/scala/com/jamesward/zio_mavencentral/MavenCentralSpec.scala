@@ -134,6 +134,16 @@ object MavenCentralSpec extends ZIOSpecDefault:
         Client.requestWithFallback(Path.decode("com/jamesward/maven-metadata.xml"), primaryBaseUrl = artifactUrl, fallbackBaseUrl = fallbackArtifactUrl).map:
           (response, _) =>
             assertTrue(response.status.isSuccess)
+
+      ,
+      test("pom"):
+        defer:
+          val myPom = pom(GroupId("com.jamesward"), ArtifactId("zio-mavencentral_3"), Version("0.1.1")).run
+
+          assertTrue(
+            (myPom \ "name").text == "zio-mavencentral"
+          )
+
     ).provide(Client.default, Scope.default),
     suite("deploy")(
       test("fail verification"):

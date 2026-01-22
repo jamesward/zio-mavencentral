@@ -13,6 +13,7 @@ import java.time.ZonedDateTime
 import java.util.zip.ZipEntry
 import scala.annotation.{targetName, unused}
 import scala.util.matching.Regex
+import scala.xml.Elem
 
 object MavenCentral:
 
@@ -207,6 +208,19 @@ object MavenCentral:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path, Method.HEAD).run
       response.status.isSuccess
+
+  def pom(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, JavadocNotFoundError | Throwable, Elem] =
+    defer:
+      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version.pom"
+      val (response, url) = Client.requestWithFallback(path, Method.GET).run
+      response.status match
+        case status if status.isSuccess =>
+          val body = response.body.asString.run
+          scala.xml.XML.loadString(body)
+        case Status.NotFound =>
+          ZIO.fail(JavadocNotFoundError(groupId, artifactId, version)).run
+        case _ =>
+          ZIO.fail(UnknownError(response)).run
 
   def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, JavadocNotFoundError | Throwable, URL] =
     defer:
