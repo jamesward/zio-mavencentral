@@ -13,7 +13,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
 
   given CanEqual[String, String] = CanEqual.derived
   given CanEqual[Seq[MavenCentral.ArtifactId], Seq[MavenCentral.ArtifactId]] = CanEqual.derived
-  given CanEqual[Exit[MavenCentral.JavadocNotFoundError | Throwable, ?], Exit[MavenCentral.JavadocNotFoundError | Throwable, ?]] = CanEqual.derived
+  given CanEqual[Exit[MavenCentral.NotFoundError | Throwable, ?], Exit[MavenCentral.NotFoundError | Throwable, ?]] = CanEqual.derived
   given CanEqual[MavenCentral.Deploy.DeploymentState, MavenCentral.Deploy.DeploymentState] = CanEqual.derived
 
   def spec = suite("MavenCentral")(
@@ -108,7 +108,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
           val doesNotExist = javadocUri(GroupId("com.jamesward"), ArtifactId("travis-central-test"), Version("0.0.15")).exit.run // todo: flip no worky?
 
           assertTrue(
-            doesNotExist == Exit.fail(JavadocNotFoundError(GroupId("com.jamesward"), ArtifactId("travis-central-test"), Version("0.0.15"))),
+            doesNotExist == Exit.fail(NotFoundError(GroupId("com.jamesward"), ArtifactId("travis-central-test"), Version("0.0.15"))),
             URL.decode("https://repo1.maven.org/maven2/org/webjars/webjars-locator-core/0.52/webjars-locator-core-0.52-javadoc.jar").contains(doesExist),
           )
       ,
@@ -142,6 +142,14 @@ object MavenCentralSpec extends ZIOSpecDefault:
 
           assertTrue(
             (myPom \ "name").text == "zio-mavencentral"
+          )
+      ,
+      test("maven-metadata"):
+        defer:
+          val myMavenMetadata = mavenMetadata(GroupId("com.jamesward"), ArtifactId("zio-mavencentral_3")).run
+
+          assertTrue(
+            (myMavenMetadata \ "groupId").text == "com.jamesward"
           )
 
     ).provide(Client.default, Scope.default),

@@ -61,7 +61,7 @@ object MavenCentral:
 
   case class GroupIdNotFoundError(groupId: GroupId)
   case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
-  case class JavadocNotFoundError(groupId: GroupId, artifactId: ArtifactId, version: Version)
+  case class NotFoundError(groupId: GroupId, artifactId: ArtifactId, version: Version)
   case class UnknownError(response: Response) extends Throwable
   case class ParseError(t: Throwable) extends Throwable
 
@@ -159,6 +159,7 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
+  // todo: use maven-metadata.xml
   def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, SeqWithLastModified[Version]] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))).addTrailingSlash
@@ -188,6 +189,7 @@ object MavenCentral:
           case Status.NotFound => ZIO.fail(maybeArtifactId.fold(GroupIdNotFoundError(groupId))(GroupIdOrArtifactIdNotFoundError(groupId, _))).run
           case e => ZIO.fail(UnknownError(response)).run
 
+  // todo: use maven-metadata.xml
   def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
     searchVersions(groupId, artifactId).map(_.items.headOption)
 
@@ -209,7 +211,7 @@ object MavenCentral:
       val (response, _) = Client.requestWithFallback(path, Method.HEAD).run
       response.status.isSuccess
 
-  def pom(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, JavadocNotFoundError | Throwable, Elem] =
+  def pom(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, NotFoundError | Throwable, Elem] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version.pom"
       val (response, url) = Client.requestWithFallback(path, Method.GET).run
@@ -218,11 +220,24 @@ object MavenCentral:
           val body = response.body.asString.run
           scala.xml.XML.loadString(body)
         case Status.NotFound =>
-          ZIO.fail(JavadocNotFoundError(groupId, artifactId, version)).run
+          ZIO.fail(NotFoundError(groupId, artifactId, version)).run
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, JavadocNotFoundError | Throwable, URL] =
+  def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Elem] =
+    defer:
+      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
+      val (response, url) = Client.requestWithFallback(path, Method.GET).run
+      response.status match
+        case status if status.isSuccess =>
+          val body = response.body.asString.run
+          scala.xml.XML.loadString(body)
+        case Status.NotFound =>
+          ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
+        case _ =>
+          ZIO.fail(UnknownError(response)).run
+
+  def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, NotFoundError | Throwable, URL] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-javadoc.jar"
       val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
@@ -230,7 +245,7 @@ object MavenCentral:
         case status if status.isSuccess =>
           ZIO.fromEither(URL.decode(url)).run
         case Status.NotFound =>
-          ZIO.fail(JavadocNotFoundError(groupId, artifactId, version)).run
+          ZIO.fail(NotFoundError(groupId, artifactId, version)).run
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
