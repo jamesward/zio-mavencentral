@@ -18,9 +18,14 @@ import scala.xml.Elem
 object MavenCentral:
 
   // todo: regionalize to maven central mirrors for lower latency
-  private val artifactUri = "https://repo1.maven.org/maven2/"
-  private val fallbackArtifactUri = "https://repo.maven.apache.org/maven2/"
+  private val artifactUri = URL.decode("https://repo1.maven.org/maven2/").toOption.get
+  private val fallbackArtifactUri = URL.decode("https://repo.maven.apache.org/maven2/").toOption.get
 
+  private val clientLoggingAspect =
+    ZClientAspect.requestLogging(
+      loggedRequestHeaders = Set(Header.UserAgent),
+      logResponseBody = true,
+    )
 
   opaque type GroupId = String
   object GroupId:
@@ -30,6 +35,10 @@ object MavenCentral:
   extension (groupId: GroupId)
     @targetName("slash")
     def /(artifactId: ArtifactId): Path = Path.root / groupId / artifactId
+    // todo: more defensive
+    def asGroupArtifact: GroupArtifact =
+      val parts = groupId.split('.')
+      GroupArtifact(GroupId(parts.init.mkString(".")), ArtifactId(parts.last))
 
   opaque type ArtifactId = String
   object ArtifactId:
@@ -118,46 +127,39 @@ object MavenCentral:
                                 method: Method = Method.GET,
                                 headers: Headers = Headers.empty,
                                 content: Body = Body.empty,
-                                primaryBaseUrl: String = artifactUri,
-                                fallbackBaseUrl: String = fallbackArtifactUri
-                              )(implicit trace: Trace): ZIO[Client & Scope, Throwable, (Response, String)] =
-      def requestAndLog(baseUrl: String) =
-        val url = baseUrl + path
-        defer:
-          ZIO.log(s"$method $url").run
-          val requestUrl = ZIO.fromEither(zio.http.URL.decode(url)).run
-          val request = Request(zio.http.Version.Default, method, requestUrl, headers, content)
-          client.batched(request)
-            .tap:
-              response =>
-                ZIO.log(s"$method $url ${response.status}")
-            .map:
-              _ -> url
-            .run
+                                primaryBaseUrl: URL = artifactUri,
+                                fallbackBaseUrl: URL = fallbackArtifactUri
+                              )(implicit trace: Trace): ZIO[Client & Scope, Throwable, (Response, URL)] =
+      ZIO.serviceWithZIO[Client]:
+        plainClient =>
+          val client = plainClient @@ clientLoggingAspect
+          val req = Request(method = method, url = primaryBaseUrl.addPath(path), headers = headers, body = content)
+          client.batched(req).map(_ -> req.url).orElse:
+            val fallbackReq = req.updateURL(_ => fallbackBaseUrl.addPath(path))
+            client.batched(fallbackReq).map(_ -> fallbackReq.url)
 
-      defer:
-        requestAndLog(primaryBaseUrl)
-          .catchSomeCause:
-            case cause: Cause[Throwable] =>
-              defer:
-                ZIO.logCause(cause).run
-                requestAndLog(fallbackBaseUrl).run
-          .run
-
+  // Removes any versions found in this groupId
   def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError | Throwable, WithLastModified[Seq[ArtifactId]]] =
-    defer:
-      val path = artifactPath(groupId).addTrailingSlash
-      val (response, _) = Client.requestWithFallback(path).run
-      response.status match
-        case Status.NotFound =>
-          ZIO.fail(GroupIdNotFoundError(groupId)).run
-        case s if s.isSuccess =>
-          WithLastModified(
-            responseToNames(response).run.map(ArtifactId(_)).sorted(using CaseInsensitiveOrdering),
-            response.header(Header.LastModified).map(_.value)
-          )
-        case _ =>
-          ZIO.fail(UnknownError(response)).run
+    val path = artifactPath(groupId).addTrailingSlash
+    val allFilesReq = Client.requestWithFallback(path).map(_._1)
+    val groupArtifact = groupId.asGroupArtifact
+    val versions = searchVersions(groupArtifact.groupId, groupArtifact.artifactId).map(_.value).orElseSucceed(Seq.empty[Version])
+    allFilesReq.zipWithPar(versions):
+      (allFilesResp, versions) =>
+        allFilesResp.status match
+          case Status.NotFound =>
+            ZIO.fail(GroupIdNotFoundError(groupId))
+          case s if s.isSuccess =>
+            responseToNames(allFilesResp).map:
+              names =>
+                WithLastModified(
+                  names.diff(versions).map(ArtifactId(_)),
+                  allFilesResp.header(Header.LastModified).map(_.value)
+                )
+          case _ =>
+            ZIO.fail(UnknownError(allFilesResp)).run
+    .flatten
+
 
   // newest first
   def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, WithLastModified[Seq[Version]]] =
@@ -236,7 +238,7 @@ object MavenCentral:
       val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
       response.status match
         case status if status.isSuccess =>
-          ZIO.fromEither(URL.decode(url)).run
+          ZIO.succeed(url).run
         case Status.NotFound =>
           ZIO.fail(NotFoundError(groupId, artifactId, version)).run
         case _ =>

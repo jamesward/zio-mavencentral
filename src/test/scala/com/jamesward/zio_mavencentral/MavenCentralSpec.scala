@@ -28,12 +28,13 @@ object MavenCentralSpec extends ZIOSpecDefault:
       test("searchArtifacts"):
         defer:
           val webjarArtifacts = searchArtifacts(GroupId("org.webjars")).run.value
+          val webjarNpmArtifacts = searchArtifacts(GroupId("org.webjars.npm")).run.value
           val springdataArtifacts = searchArtifacts(GroupId("org.springframework.data")).run.value
           val err = searchArtifacts(GroupId("zxcv12313asdf")).flip.run
 
           assertTrue(
             webjarArtifacts.size > 1000,
-            webjarArtifacts == webjarArtifacts.sorted(using CaseInsensitiveOrdering),
+            !webjarNpmArtifacts.contains(ArtifactId("3.10.9")),
             springdataArtifacts.size > 10,
             err.isInstanceOf[GroupIdNotFoundError],
           )
@@ -128,8 +129,8 @@ object MavenCentralSpec extends ZIOSpecDefault:
       ,
       // note that on some networks all DNS requests are accepted and redirect to something like a captive portal, wtf
       test("requestWithFallbackurl"):
-        val artifactUrl = "https://zxcvasdf123124zxcv.com/"
-        val fallbackArtifactUrl = "https://repo1.maven.org/maven2/"
+        val artifactUrl = URL.decode("https://zxcvasdf123124zxcv.com/").toOption.get
+        val fallbackArtifactUrl = URL.decode("https://repo1.maven.org/maven2/").toOption.get
         // bug in zio-direct:
         // assertTrue(response.status.isSuccess)
         // Exception occurred while executing macro expansion.
