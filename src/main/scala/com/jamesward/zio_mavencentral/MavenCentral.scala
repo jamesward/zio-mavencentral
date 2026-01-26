@@ -57,7 +57,7 @@ object MavenCentral:
     lazy val toPath: Path = groupId / artifactId / version
     override def toString: String = s"$groupId/$artifactId/$version"
 
-  case class SeqWithLastModified[A](items: Seq[A], maybeLastModified: Option[ZonedDateTime])
+  case class WithLastModified[A](value: A, maybeLastModified: Option[ZonedDateTime])
 
   case class GroupIdNotFoundError(groupId: GroupId)
   case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
@@ -144,7 +144,7 @@ object MavenCentral:
                 requestAndLog(fallbackBaseUrl).run
           .run
 
-  def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError | Throwable, SeqWithLastModified[ArtifactId]] =
+  def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError | Throwable, WithLastModified[Seq[ArtifactId]]] =
     defer:
       val path = artifactPath(groupId).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path).run
@@ -152,58 +152,51 @@ object MavenCentral:
         case Status.NotFound =>
           ZIO.fail(GroupIdNotFoundError(groupId)).run
         case s if s.isSuccess =>
-          SeqWithLastModified(
+          WithLastModified(
             responseToNames(response).run.map(ArtifactId(_)).sorted(using CaseInsensitiveOrdering),
             response.header(Header.LastModified).map(_.value)
           )
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  // todo: use maven-metadata.xml
-  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, SeqWithLastModified[Version]] =
+  // newest first
+  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, WithLastModified[Seq[Version]]] =
     defer:
-      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))).addTrailingSlash
-      val (response, _) = Client.requestWithFallback(path).run
-      response.status match
-        case Status.NotFound =>
-          ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
-        case s if s.isSuccess =>
-          SeqWithLastModified(
-            responseToNames(response).run
-              .sortBy(semverfi.Version(_))
-              .reverse
-              .map(Version(_)),
-            response.header(Header.LastModified).map(_.value)
-          )
-        case _ =>
-          ZIO.fail(UnknownError(response)).run
+      val metadata = mavenMetadata(groupId, artifactId).run
+      val versions = metadata.value \ "versioning" \ "versions" \ "version"
+      WithLastModified(
+        versions.map(n => Version(n.text)).reverse,
+        metadata.maybeLastModified
+      )
 
   def isModifiedSince(dateTime: ZonedDateTime, groupId: GroupId, maybeArtifactId: Option[ArtifactId] = None):
     ZIO[Client & Scope, GroupIdNotFoundError | GroupIdOrArtifactIdNotFoundError | Throwable, Boolean] =
       defer:
-        val path = artifactPath(groupId, maybeArtifactId.map(ArtifactAndVersion(_))).addTrailingSlash
+        val path = maybeArtifactId.fold(artifactPath(groupId).addTrailingSlash)(artifactId => artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml")
         val (response, _) = Client.requestWithFallback(path, Method.HEAD, Headers(Header.IfModifiedSince(dateTime))).run
         response.status match
-          case Status.Ok => ZIO.succeed(true).run
+          case Status.Ok =>
+            // workaround for MavenCentral exact time matching on file not working correctly
+            if response.header(Header.LastModified).map(_.value).contains(dateTime) then
+              ZIO.succeed(false).run
+            else
+              ZIO.succeed(true).run
           case Status.NotModified => ZIO.succeed(false).run
           case Status.NotFound => ZIO.fail(maybeArtifactId.fold(GroupIdNotFoundError(groupId))(GroupIdOrArtifactIdNotFoundError(groupId, _))).run
           case e => ZIO.fail(UnknownError(response)).run
 
-  // todo: use maven-metadata.xml
+  // todo: potentially use maven-metadata.xml
   def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
-    searchVersions(groupId, artifactId).map(_.items.headOption)
+    searchVersions(groupId, artifactId).map(_.value.headOption)
 
   def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, Throwable, Boolean] =
     defer:
-      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
-      val (response, _) = Client.requestWithFallback(path).run
-      response.status match
-        case s if s.isSuccess =>
-          val body = response.body.asString.run
-          // checks that the maven-metadata.xml contains the groupId
-          body.contains(s"<groupId>$groupId</groupId>")
-        case _ =>
-          false
+      val metadata = mavenMetadata(groupId, artifactId).run
+      val body = metadata.value.toString
+      // checks that the maven-metadata.xml contains the groupId
+      body.contains(s"<groupId>$groupId</groupId>")
+    .catchAll:
+      _ => ZIO.succeed(false)
 
   def artifactExists(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, Throwable, Boolean] =
     defer:
@@ -224,14 +217,14 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Elem] =
+  def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, WithLastModified[Elem]] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
       val (response, url) = Client.requestWithFallback(path, Method.GET).run
       response.status match
         case status if status.isSuccess =>
           val body = response.body.asString.run
-          scala.xml.XML.loadString(body)
+          WithLastModified(scala.xml.XML.loadString(body), response.header(Header.LastModified).map(_.value))
         case Status.NotFound =>
           ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
         case _ =>

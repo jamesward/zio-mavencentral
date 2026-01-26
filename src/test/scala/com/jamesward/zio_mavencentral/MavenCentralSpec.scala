@@ -27,8 +27,8 @@ object MavenCentralSpec extends ZIOSpecDefault:
       ,
       test("searchArtifacts"):
         defer:
-          val webjarArtifacts = searchArtifacts(GroupId("org.webjars")).run.items
-          val springdataArtifacts = searchArtifacts(GroupId("org.springframework.data")).run.items
+          val webjarArtifacts = searchArtifacts(GroupId("org.webjars")).run.value
+          val springdataArtifacts = searchArtifacts(GroupId("org.springframework.data")).run.value
           val err = searchArtifacts(GroupId("zxcv12313asdf")).flip.run
 
           assertTrue(
@@ -40,7 +40,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
       ,
       test("searchVersions"):
         defer:
-          val versions = searchVersions(GroupId("org.webjars"), ArtifactId("jquery")).run.items
+          val versions = searchVersions(GroupId("org.webjars"), ArtifactId("jquery")).run.value
           val err = searchVersions(GroupId("com.jamesward"), ArtifactId("zxcvasdf")).flip.run
 
           assertTrue(
@@ -51,7 +51,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
       ,
       test("searchVersions does not change versions"):
         defer:
-          val versions = searchVersions(GroupId("io.jenkins.archetypes"), ArtifactId("archetypes-parent")).run.items
+          val versions = searchVersions(GroupId("io.jenkins.archetypes"), ArtifactId("archetypes-parent")).run.value
           assertTrue:
             versions.contains("1.21")
       ,
@@ -78,9 +78,12 @@ object MavenCentralSpec extends ZIOSpecDefault:
 
           val isModifiedSinceLongAgo = isModifiedSince(ZonedDateTime.now().minusYears(10), GroupId("org.webjars"), Some(ArtifactId("bootstrap"))).run
 
+          val isModifiedSinceFuture = isModifiedSince(ZonedDateTime.now().plusSeconds(1), GroupId("org.webjars"), Some(ArtifactId("bootstrap"))).run
+
           assertTrue(
             !isModifiedSinceLastModified,
-            isModifiedSinceLongAgo
+            isModifiedSinceLongAgo,
+            !isModifiedSinceFuture
           )
       ,
       test("latest"):
@@ -149,7 +152,8 @@ object MavenCentralSpec extends ZIOSpecDefault:
           val myMavenMetadata = mavenMetadata(GroupId("com.jamesward"), ArtifactId("zio-mavencentral_3")).run
 
           assertTrue(
-            (myMavenMetadata \ "groupId").text == "com.jamesward"
+            (myMavenMetadata.value \ "groupId").text == "com.jamesward",
+            myMavenMetadata.maybeLastModified.isDefined
           )
 
     ).provide(Client.default, Scope.default),
