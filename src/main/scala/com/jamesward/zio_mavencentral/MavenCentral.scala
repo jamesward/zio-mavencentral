@@ -65,8 +65,8 @@ object MavenCentral:
   case class GroupIdNotFoundError(groupId: GroupId)
   case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
   case class NotFoundError(groupId: GroupId, artifactId: ArtifactId, version: Version)
-  case class UnknownError(response: Response) extends Throwable
-  case class ParseError(t: Throwable) extends Throwable
+  case class UnknownError(response: Response) extends Throwable(response.status.text)
+  case class ParseError(t: Throwable) extends Throwable(t)
 
   given Schema[GroupId] = Schema.primitive[String].transform(MavenCentral.GroupId.apply, _.toString)
   given Schema[ArtifactId] = Schema.primitive[String].transform(MavenCentral.ArtifactId.apply, _.toString)
@@ -234,6 +234,18 @@ object MavenCentral:
   def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, NotFoundError | Throwable, URL] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-javadoc.jar"
+      val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
+      response.status match
+        case status if status.isSuccess =>
+          ZIO.succeed(url).run
+        case Status.NotFound =>
+          ZIO.fail(NotFoundError(groupId, artifactId, version)).run
+        case _ =>
+          ZIO.fail(UnknownError(response)).run
+
+  def sourcesUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, NotFoundError | Throwable, URL] =
+    defer:
+      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-sources.jar"
       val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
       response.status match
         case status if status.isSuccess =>
