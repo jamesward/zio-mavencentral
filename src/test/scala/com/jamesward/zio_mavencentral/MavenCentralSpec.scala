@@ -3,7 +3,7 @@ package com.jamesward.zio_mavencentral
 import MavenCentral.{*, given}
 import zio.*
 import zio.direct.*
-import zio.http.{Client, Path, URL}
+import zio.http.{Client, Path, URL, ZClientAspect}
 import zio.test.*
 
 import java.nio.file.Files
@@ -157,7 +157,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
             myMavenMetadata.maybeLastModified.isDefined
           )
 
-    ).provide(Client.default, Scope.default),
+    ).provide(Client.default.update(_ @@ ZClientAspect.requestLogging()), Scope.default),
     suite("deploy")(
       test("fail verification"):
         val filename = "momentjs-exists.zip"
@@ -189,6 +189,6 @@ object MavenCentralSpec extends ZIOSpecDefault:
             .run
 
           assertTrue(status == MavenCentral.Deploy.DeploymentState.VALIDATED)
-    ).provide(Client.default, MavenCentral.Deploy.Sonatype.Live) @@ TestAspect.ifEnvSet("OSS_DEPLOY_USERNAME") @@ TestAspect.ifEnvSet("OSS_DEPLOY_PASSWORD") @@ TestAspect.withLiveSystem @@ TestAspect.withLiveClock
+    ).provide(Client.default.update(_ @@ ZClientAspect.requestLogging()), MavenCentral.Deploy.Sonatype.Live) @@ TestAspect.ifEnvSet("OSS_DEPLOY_USERNAME") @@ TestAspect.ifEnvSet("OSS_DEPLOY_PASSWORD") @@ TestAspect.withLiveSystem @@ TestAspect.withLiveClock
   )
 

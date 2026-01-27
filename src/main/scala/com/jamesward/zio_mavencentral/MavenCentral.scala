@@ -21,12 +21,6 @@ object MavenCentral:
   private val artifactUri = URL.decode("https://repo1.maven.org/maven2/").toOption.get
   private val fallbackArtifactUri = URL.decode("https://repo.maven.apache.org/maven2/").toOption.get
 
-  private val clientLoggingAspect =
-    ZClientAspect.requestLogging(
-      loggedRequestHeaders = Set(Header.UserAgent),
-      logResponseBody = true,
-    )
-
   opaque type GroupId = String
   object GroupId:
     def apply(s: String): GroupId = s
@@ -66,7 +60,7 @@ object MavenCentral:
     lazy val toPath: Path = groupId / artifactId / version
     override def toString: String = s"$groupId/$artifactId/$version"
 
-  case class WithLastModified[A](value: A, maybeLastModified: Option[ZonedDateTime])
+  case class WithCacheInfo[A](value: A, maybeLastModified: Option[ZonedDateTime], maybeEtag: Option[Header.ETag])
 
   case class GroupIdNotFoundError(groupId: GroupId)
   case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
@@ -131,15 +125,14 @@ object MavenCentral:
                                 fallbackBaseUrl: URL = fallbackArtifactUri
                               )(implicit trace: Trace): ZIO[Client & Scope, Throwable, (Response, URL)] =
       ZIO.serviceWithZIO[Client]:
-        plainClient =>
-          val client = plainClient @@ clientLoggingAspect
+        client =>
           val req = Request(method = method, url = primaryBaseUrl.addPath(path), headers = headers, body = content)
           client.batched(req).map(_ -> req.url).orElse:
             val fallbackReq = req.updateURL(_ => fallbackBaseUrl.addPath(path))
             client.batched(fallbackReq).map(_ -> fallbackReq.url)
 
   // Removes any versions found in this groupId
-  def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError | Throwable, WithLastModified[Seq[ArtifactId]]] =
+  def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError | Throwable, WithCacheInfo[Seq[ArtifactId]]] =
     val path = artifactPath(groupId).addTrailingSlash
     val allFilesReq = Client.requestWithFallback(path).map(_._1)
     val groupArtifact = groupId.asGroupArtifact
@@ -152,9 +145,10 @@ object MavenCentral:
           case s if s.isSuccess =>
             responseToNames(allFilesResp).map:
               names =>
-                WithLastModified(
+                WithCacheInfo(
                   names.diff(versions).map(ArtifactId(_)),
-                  allFilesResp.header(Header.LastModified).map(_.value)
+                  allFilesResp.header(Header.LastModified).map(_.value),
+                  allFilesResp.header(Header.ETag)
                 )
           case _ =>
             ZIO.fail(UnknownError(allFilesResp)).run
@@ -162,13 +156,14 @@ object MavenCentral:
 
 
   // newest first
-  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, WithLastModified[Seq[Version]]] =
+  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, WithCacheInfo[Seq[Version]]] =
     defer:
       val metadata = mavenMetadata(groupId, artifactId).run
       val versions = metadata.value \ "versioning" \ "versions" \ "version"
-      WithLastModified(
+      WithCacheInfo(
         versions.map(n => Version(n.text)).reverse,
-        metadata.maybeLastModified
+        metadata.maybeLastModified,
+        metadata.maybeEtag,
       )
 
   def isModifiedSince(dateTime: ZonedDateTime, groupId: GroupId, maybeArtifactId: Option[ArtifactId] = None):
@@ -219,14 +214,18 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, WithLastModified[Elem]] =
+  def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, WithCacheInfo[Elem]] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
       val (response, url) = Client.requestWithFallback(path, Method.GET).run
       response.status match
         case status if status.isSuccess =>
           val body = response.body.asString.run
-          WithLastModified(scala.xml.XML.loadString(body), response.header(Header.LastModified).map(_.value))
+          WithCacheInfo(
+            scala.xml.XML.loadString(body),
+            response.header(Header.LastModified).map(_.value),
+            response.header(Header.ETag)
+          )
         case Status.NotFound =>
           ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
         case _ =>
@@ -245,24 +244,32 @@ object MavenCentral:
           ZIO.fail(UnknownError(response)).run
 
   // what about file locking?
-  def downloadAndExtractZip(source: URL, destination: File): ZIO[Client & Scope, Throwable, Unit] =
+  def downloadAndExtractZip(source: URL, destination: File): ZIO[Client & Scope, Throwable, WithCacheInfo[Set[String]]] =
     defer:
       val request = Request.get(source)
       val response = Client.batched(request).run
       if response.status.isError then
         ZIO.fail(UnknownError(response)).run
       else
-        val sink = ZSink.foreach[Any, Throwable, (ArchiveEntry[Option, ZipEntry], ZStream[Any, IOException, Byte])]:
-          case (entry, contentStream) =>
+        val sink = ZSink.foldLeftZIO[Any, Throwable, (ArchiveEntry[Option, ZipEntry], ZStream[Any, IOException, Byte]), Set[String]](Set.empty[String]):
+          case (fileList, (entry, contentStream)) =>
             val targetPath = destination.toPath.resolve(entry.name)
 
             if entry.isDirectory then
-              ZIO.attemptBlockingIO(Files.createDirectories(targetPath))
+              ZIO.attemptBlockingIO(Files.createDirectories(targetPath)).as:
+                fileList
             else
               ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
-                contentStream.run(ZSink.fromPath(targetPath))
+                contentStream.run(ZSink.fromPath(targetPath)).as:
+                  fileList + entry.name
 
-        response.body.asStream.via(ZipUnarchiver.unarchive).run(sink).unit.run
+        val fileList = response.body.asStream.via(ZipUnarchiver.unarchive).run(sink).run
+
+        WithCacheInfo(
+          fileList,
+          response.header(Header.LastModified).map(_.value),
+          response.header(Header.ETag)
+        )
 
   object Deploy:
     import zio.http.Header.Authorization
@@ -289,7 +296,6 @@ object MavenCentral:
                 response.body.asString.flatMap:
                   body =>
                     ZIO.fail(IllegalStateException(s"Sonatype request failed ${response.status} : $body"))
-        @@ ZClientAspect.requestLogging()
 
       val Live: ZLayer[Client, Throwable, Sonatype] =
         ZLayer.fromZIO:
