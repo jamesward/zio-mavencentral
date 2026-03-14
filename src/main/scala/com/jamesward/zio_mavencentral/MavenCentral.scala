@@ -268,6 +268,7 @@ object MavenCentral:
             val targetPath = destination.toPath.resolve(entry.name)
 
             if entry.isDirectory then
+              contentStream.runDrain *>
               ZIO.attemptBlockingIO(Files.createDirectories(targetPath)).as:
                 fileList
             else
