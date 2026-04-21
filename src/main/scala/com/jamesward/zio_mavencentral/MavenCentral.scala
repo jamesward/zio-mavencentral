@@ -259,7 +259,7 @@ object MavenCentral:
   def downloadAndExtractZip(source: URL, destination: File): ZIO[Client & Scope, Throwable, WithCacheInfo[Set[String]]] =
     defer:
       val request = Request.get(source)
-      val response = Client.batched(request).run
+      val response = Client.streaming(request).run
       if response.status.isError then
         ZIO.fail(UnknownError(response)).run
       else
