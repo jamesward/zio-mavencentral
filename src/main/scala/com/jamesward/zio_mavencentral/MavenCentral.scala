@@ -123,7 +123,7 @@ object MavenCentral:
                                 content: Body = Body.empty,
                                 primaryBaseUrl: URL = artifactUri,
                                 fallbackBaseUrl: URL = fallbackArtifactUri
-                              )(implicit trace: Trace): ZIO[Client & Scope, Throwable, (Response, URL)] =
+                              )(implicit trace: Trace): ZIO[Client, Throwable, (Response, URL)] =
       ZIO.serviceWithZIO[Client]:
         client =>
           val req = Request(method = method, url = primaryBaseUrl.addPath(path), headers = headers, body = content)
@@ -132,7 +132,7 @@ object MavenCentral:
             client.batched(fallbackReq).map(_ -> fallbackReq.url)
 
   // Removes any versions found in this groupId
-  def searchArtifacts(groupId: GroupId): ZIO[Client & Scope, GroupIdNotFoundError | Throwable, WithCacheInfo[Seq[ArtifactId]]] =
+  def searchArtifacts(groupId: GroupId): ZIO[Client, GroupIdNotFoundError | Throwable, WithCacheInfo[Seq[ArtifactId]]] =
     val path = artifactPath(groupId).addTrailingSlash
     val allFilesReq = Client.requestWithFallback(path).map(_._1)
     val groupArtifact = groupId.asGroupArtifact
@@ -156,7 +156,7 @@ object MavenCentral:
 
 
   // newest first
-  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, WithCacheInfo[Seq[Version]]] =
+  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, WithCacheInfo[Seq[Version]]] =
     defer:
       val metadata = mavenMetadata(groupId, artifactId).run
       val versions = metadata.value \ "versioning" \ "versions" \ "version"
@@ -167,7 +167,7 @@ object MavenCentral:
       )
 
   def isModifiedSince(dateTime: ZonedDateTime, groupId: GroupId, maybeArtifactId: Option[ArtifactId] = None):
-    ZIO[Client & Scope, GroupIdNotFoundError | GroupIdOrArtifactIdNotFoundError | Throwable, Boolean] =
+    ZIO[Client, GroupIdNotFoundError | GroupIdOrArtifactIdNotFoundError | Throwable, Boolean] =
       defer:
         val path = maybeArtifactId.fold(artifactPath(groupId).addTrailingSlash)(artifactId => artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml")
         val (response, _) = Client.requestWithFallback(path, Method.HEAD, Headers(Header.IfModifiedSince(dateTime))).run
@@ -183,10 +183,10 @@ object MavenCentral:
           case e => ZIO.fail(UnknownError(response)).run
 
   // todo: potentially use maven-metadata.xml
-  def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
+  def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
     searchVersions(groupId, artifactId).map(_.value.headOption)
 
-  def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, Throwable, Boolean] =
+  def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, Throwable, Boolean] =
     defer:
       val metadata = mavenMetadata(groupId, artifactId).run
       val body = metadata.value.toString
@@ -195,13 +195,13 @@ object MavenCentral:
     .catchAll:
       _ => ZIO.succeed(false)
 
-  def artifactExists(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, Throwable, Boolean] =
+  def artifactExists(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, Throwable, Boolean] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))).addTrailingSlash
       val (response, _) = Client.requestWithFallback(path, Method.HEAD).run
       response.status.isSuccess
 
-  def pom(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, NotFoundError | Throwable, Elem] =
+  def pom(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | Throwable, Elem] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version.pom"
       val (response, url) = Client.requestWithFallback(path, Method.GET).run
@@ -214,7 +214,7 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[Client & Scope, GroupIdOrArtifactIdNotFoundError | Throwable, WithCacheInfo[Elem]] =
+  def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, WithCacheInfo[Elem]] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
       val (response, url) = Client.requestWithFallback(path, Method.GET).run
@@ -231,7 +231,7 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, NotFoundError | Throwable, URL] =
+  def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | Throwable, URL] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-javadoc.jar"
       val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
@@ -243,7 +243,7 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def sourcesUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client & Scope, NotFoundError | Throwable, URL] =
+  def sourcesUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | Throwable, URL] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-sources.jar"
       val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
@@ -256,33 +256,34 @@ object MavenCentral:
           ZIO.fail(UnknownError(response)).run
 
   // what about file locking?
-  def downloadAndExtractZip(source: URL, destination: File): ZIO[Client & Scope, Throwable, WithCacheInfo[Set[String]]] =
-    defer:
-      val request = Request.get(source)
-      val response = Client.streaming(request).run
-      if response.status.isError then
-        ZIO.fail(UnknownError(response)).run
-      else
-        val sink = ZSink.foldLeftZIO[Any, Throwable, (ArchiveEntry[Option, ZipEntry], ZStream[Any, IOException, Byte]), Set[String]](Set.empty[String]):
-          case (fileList, (entry, contentStream)) =>
-            val targetPath = destination.toPath.resolve(entry.name)
+  def downloadAndExtractZip(source: URL, destination: File): ZIO[Client, Throwable, WithCacheInfo[Set[String]]] =
+    ZIO.scoped:
+      defer:
+        val request = Request.get(source)
+        val response = Client.streaming(request).run
+        if response.status.isError then
+          ZIO.fail(UnknownError(response)).run
+        else
+          val sink = ZSink.foldLeftZIO[Any, Throwable, (ArchiveEntry[Option, ZipEntry], ZStream[Any, IOException, Byte]), Set[String]](Set.empty[String]):
+            case (fileList, (entry, contentStream)) =>
+              val targetPath = destination.toPath.resolve(entry.name)
 
-            if entry.isDirectory then
-              contentStream.runDrain *>
-              ZIO.attemptBlockingIO(Files.createDirectories(targetPath)).as:
-                fileList
-            else
-              ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
-                contentStream.run(ZSink.fromPath(targetPath)).as:
-                  fileList + entry.name
+              if entry.isDirectory then
+                contentStream.runDrain *>
+                ZIO.attemptBlockingIO(Files.createDirectories(targetPath)).as:
+                  fileList
+              else
+                ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
+                  contentStream.run(ZSink.fromPath(targetPath)).as:
+                    fileList + entry.name
 
-        val fileList = response.body.asStream.via(ZipUnarchiver.unarchive).run(sink).run
+          val fileList = response.body.asStream.via(ZipUnarchiver.unarchive).run(sink).run
 
-        WithCacheInfo(
-          fileList,
-          response.header(Header.LastModified).map(_.value),
-          response.header(Header.ETag)
-        )
+          WithCacheInfo(
+            fileList,
+            response.header(Header.LastModified).map(_.value),
+            response.header(Header.ETag)
+          )
 
   object Deploy:
     import zio.http.Header.Authorization
