@@ -282,6 +282,31 @@ object MavenCentral:
           response.header(Header.ETag)
         )
 
+  // Streaming variant of downloadAndExtractZip. Unlike `downloadAndExtractZip`, this
+  // does NOT materialize the response body in memory (no Client.batched), does NOT
+  // accumulate a file list, and does NOT return Maven Central cache metadata. Suitable
+  // for large jars where memory usage matters. Response body flows directly from the
+  // network through the unzip pipeline into on-disk files.
+  def downloadAndExtractZipStreaming(source: URL, destination: File): ZIO[Client & Scope, Throwable, Unit] =
+    defer:
+      val request = Request.get(source)
+      val response = Client.streaming(request).run
+      if response.status.isError then
+        ZIO.fail(UnknownError(response)).run
+      else
+        response.body.asStream
+          .via(ZipUnarchiver.unarchive)
+          .mapZIO: (entry, contentStream) =>
+            val targetPath = destination.toPath.resolve(entry.name)
+            if entry.isDirectory then
+              contentStream.runDrain *>
+                ZIO.attemptBlockingIO(Files.createDirectories(targetPath))
+            else
+              ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
+                contentStream.run(ZSink.fromPath(targetPath)).unit
+          .runDrain
+          .run
+
   object Deploy:
     import zio.http.Header.Authorization
 

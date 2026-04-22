@@ -127,6 +127,17 @@ object MavenCentralSpec extends ZIOSpecDefault:
           )
         )
       ,
+      test("downloadAndExtractZipStreaming"):
+        val url = URL.decode("https://repo1.maven.org/maven2/com/jamesward/travis-central-test/0.0.15/travis-central-test-0.0.15.jar").toOption.get
+        val tmpFile = Files.createTempDirectory("test-streaming").nn.toFile.nn
+
+        downloadAndExtractZipStreaming(url, tmpFile).as(
+          assertTrue(
+            tmpFile.list().nn.contains("META-INF"),
+            tmpFile.toPath.resolve("META-INF/maven/com.jamesward/travis-central-test/pom.properties").toFile.length() == 118,
+          )
+        )
+      ,
       // note that on some networks all DNS requests are accepted and redirect to something like a captive portal, wtf
       test("requestWithFallbackurl"):
         val artifactUrl = URL.decode("https://zxcvasdf123124zxcv.com/").toOption.get
