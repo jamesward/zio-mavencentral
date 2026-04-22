@@ -257,33 +257,30 @@ object MavenCentral:
 
   // what about file locking?
   def downloadAndExtractZip(source: URL, destination: File): ZIO[Client, Throwable, WithCacheInfo[Set[String]]] =
-    ZIO.scoped:
-      defer:
-        val request = Request.get(source)
-        val response = Client.streaming(request).run
-        if response.status.isError then
-          ZIO.fail(UnknownError(response)).run
-        else
-          val sink = ZSink.foldLeftZIO[Any, Throwable, (ArchiveEntry[Option, ZipEntry], ZStream[Any, IOException, Byte]), Set[String]](Set.empty[String]):
-            case (fileList, (entry, contentStream)) =>
-              val targetPath = destination.toPath.resolve(entry.name)
+    defer:
+      val request = Request.get(source)
+      val response = Client.batched(request).run
+      if response.status.isError then
+        ZIO.fail(UnknownError(response)).run
+      else
+        val fileList = response.body.asStream
+          .via(ZipUnarchiver.unarchive)
+          .mapZIO: (entry, contentStream) =>
+            val targetPath = destination.toPath.resolve(entry.name)
+            if entry.isDirectory then
+              (contentStream.runDrain *>
+                ZIO.attemptBlockingIO(Files.createDirectories(targetPath))).as(Option.empty[String])
+            else
+              (ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
+                contentStream.run(ZSink.fromPath(targetPath))).as(Some(entry.name))
+          .runFold(Set.empty[String])((acc, maybeName) => maybeName.fold(acc)(acc + _))
+          .run
 
-              if entry.isDirectory then
-                contentStream.runDrain *>
-                ZIO.attemptBlockingIO(Files.createDirectories(targetPath)).as:
-                  fileList
-              else
-                ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
-                  contentStream.run(ZSink.fromPath(targetPath)).as:
-                    fileList + entry.name
-
-          val fileList = response.body.asStream.via(ZipUnarchiver.unarchive).run(sink).run
-
-          WithCacheInfo(
-            fileList,
-            response.header(Header.LastModified).map(_.value),
-            response.header(Header.ETag)
-          )
+        WithCacheInfo(
+          fileList,
+          response.header(Header.LastModified).map(_.value),
+          response.header(Header.ETag)
+        )
 
   object Deploy:
     import zio.http.Header.Authorization
