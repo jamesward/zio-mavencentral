@@ -287,25 +287,31 @@ object MavenCentral:
   // accumulate a file list, and does NOT return Maven Central cache metadata. Suitable
   // for large jars where memory usage matters. Response body flows directly from the
   // network through the unzip pipeline into on-disk files.
-  def downloadAndExtractZipStreaming(source: URL, destination: File): ZIO[Client & Scope, Throwable, Unit] =
-    defer:
-      val request = Request.get(source)
-      val response = Client.streaming(request).run
-      if response.status.isError then
-        ZIO.fail(UnknownError(response)).run
-      else
-        response.body.asStream
-          .via(ZipUnarchiver.unarchive)
-          .mapZIO: (entry, contentStream) =>
-            val targetPath = destination.toPath.resolve(entry.name)
-            if entry.isDirectory then
-              contentStream.runDrain *>
-                ZIO.attemptBlockingIO(Files.createDirectories(targetPath))
-            else
-              ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
-                contentStream.run(ZSink.fromPath(targetPath)).unit
-          .runDrain
-          .run
+  //
+  // Scoped internally so the streaming connection is released back to the client
+  // connection pool as soon as the download+extraction completes, rather than at
+  // caller-scope lifetime (which risks exhausting the default 10-connection pool
+  // when invoked from long-lived scopes such as a `Cache` lookup).
+  def downloadAndExtractZipStreaming(source: URL, destination: File): ZIO[Client, Throwable, Unit] =
+    ZIO.scoped:
+      defer:
+        val request = Request.get(source)
+        val response = Client.streaming(request).run
+        if response.status.isError then
+          ZIO.fail(UnknownError(response)).run
+        else
+          response.body.asStream
+            .via(ZipUnarchiver.unarchive)
+            .mapZIO: (entry, contentStream) =>
+              val targetPath = destination.toPath.resolve(entry.name)
+              if entry.isDirectory then
+                contentStream.runDrain *>
+                  ZIO.attemptBlockingIO(Files.createDirectories(targetPath))
+              else
+                ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
+                  contentStream.run(ZSink.fromPath(targetPath)).unit
+            .runDrain
+            .run
 
   object Deploy:
     import zio.http.Header.Authorization
