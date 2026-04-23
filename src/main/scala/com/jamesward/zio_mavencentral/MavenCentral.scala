@@ -1,6 +1,5 @@
 package com.jamesward.zio_mavencentral
 
-import zio.compress.{ArchiveEntry, ZipUnarchiver}
 import zio.direct.*
 import zio.http.*
 import zio.schema.{Schema, derived}
@@ -10,7 +9,6 @@ import zio.{Cause, Chunk, Schedule, Scope, Trace, ZIO, ZLayer, durationInt}
 import java.io.{File, IOException}
 import java.nio.file.Files
 import java.time.ZonedDateTime
-import java.util.zip.ZipEntry
 import scala.annotation.{targetName, unused}
 import scala.util.matching.Regex
 import scala.xml.Elem
@@ -255,63 +253,50 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  // what about file locking?
-  def downloadAndExtractZip(source: URL, destination: File): ZIO[Client, Throwable, WithCacheInfo[Set[String]]] =
-    defer:
-      val request = Request.get(source)
-      val response = Client.batched(request).run
-      if response.status.isError then
-        ZIO.fail(UnknownError(response)).run
-      else
-        val fileList = response.body.asStream
-          .via(ZipUnarchiver.unarchive)
-          .mapZIO: (entry, contentStream) =>
-            val targetPath = destination.toPath.resolve(entry.name)
-            if entry.isDirectory then
-              (contentStream.runDrain *>
-                ZIO.attemptBlockingIO(Files.createDirectories(targetPath))).as(Option.empty[String])
-            else
-              (ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
-                contentStream.run(ZSink.fromPath(targetPath))).as(Some(entry.name))
-          .runFold(Set.empty[String])((acc, maybeName) => maybeName.fold(acc)(acc + _))
-          .run
-
-        WithCacheInfo(
-          fileList,
-          response.header(Header.LastModified).map(_.value),
-          response.header(Header.ETag)
-        )
-
-  // Streaming variant of downloadAndExtractZip. Unlike `downloadAndExtractZip`, this
-  // does NOT materialize the response body in memory (no Client.batched), does NOT
-  // accumulate a file list, and does NOT return Maven Central cache metadata. Suitable
-  // for large jars where memory usage matters. Response body flows directly from the
-  // network through the unzip pipeline into on-disk files.
-  //
-  // Scoped internally so the streaming connection is released back to the client
-  // connection pool as soon as the download+extraction completes, rather than at
-  // caller-scope lifetime (which risks exhausting the default 10-connection pool
-  // when invoked from long-lived scopes such as a `Cache` lookup).
-  def downloadAndExtractZipStreaming(source: URL, destination: File): ZIO[Client, Throwable, Unit] =
+  // Extract a downloaded zip file to a destination directory using java.util.zip.ZipFile
+  // (random access, avoids the concurrency issues of streaming unarchivers under load).
+  private def extractZipFile(zipPath: java.nio.file.Path, destination: File): ZIO[Any, Throwable, Set[String]] =
     ZIO.scoped:
       defer:
-        val request = Request.get(source)
-        val response = Client.streaming(request).run
+        val zipFile = ZIO.fromAutoCloseable(ZIO.attemptBlockingIO(new java.util.zip.ZipFile(zipPath.toFile))).run
+        ZIO.attemptBlockingIO:
+          import scala.jdk.CollectionConverters.*
+          zipFile.entries().nn.asScala.foldLeft(Set.empty[String]): (acc, entry) =>
+            val targetPath = destination.toPath.resolve(entry.getName)
+            if entry.isDirectory then
+              Files.createDirectories(targetPath)
+              acc
+            else
+              Files.createDirectories(targetPath.getParent)
+              val is = zipFile.getInputStream(entry).nn
+              try Files.copy(is, targetPath) finally is.close()
+              acc + entry.getName.nn
+        .run
+
+  // Download a zip to a temporary file, extract it to `destination`, then delete the tmp file.
+  // The download step returns HTTP response headers for cache metadata extraction.
+  private def downloadAndExtract(source: URL, destination: File): ZIO[Client, Throwable, (Response, Set[String])] =
+    ZIO.scoped:
+      defer:
+        val tmpFile = ZIO.acquireRelease(
+          ZIO.attemptBlockingIO(Files.createTempFile("mvncentral-dl-", ".zip").nn)
+        )(path => ZIO.attemptBlockingIO(Files.deleteIfExists(path)).ignoreLogged).run
+        val response = Client.streaming(Request.get(source)).run
         if response.status.isError then
           ZIO.fail(UnknownError(response)).run
-        else
-          response.body.asStream
-            .via(ZipUnarchiver.unarchive)
-            .mapZIO: (entry, contentStream) =>
-              val targetPath = destination.toPath.resolve(entry.name)
-              if entry.isDirectory then
-                contentStream.runDrain *>
-                  ZIO.attemptBlockingIO(Files.createDirectories(targetPath))
-              else
-                ZIO.attemptBlockingIO(Files.createDirectories(targetPath.getParent)) *>
-                  contentStream.run(ZSink.fromPath(targetPath)).unit
-            .runDrain
-            .run
+        response.body.asStream.run(ZSink.fromPath(tmpFile)).run
+        val files = extractZipFile(tmpFile, destination).run
+        (response, files)
+
+  // Download and extract a zip, returning the list of extracted files along with
+  // Maven Central cache metadata (Last-Modified / ETag) from the HTTP response.
+  def downloadAndExtractZip(source: URL, destination: File): ZIO[Client, Throwable, WithCacheInfo[Set[String]]] =
+    downloadAndExtract(source, destination).map: (response, files) =>
+      WithCacheInfo(
+        files,
+        response.header(Header.LastModified).map(_.value),
+        response.header(Header.ETag),
+      )
 
   object Deploy:
     import zio.http.Header.Authorization

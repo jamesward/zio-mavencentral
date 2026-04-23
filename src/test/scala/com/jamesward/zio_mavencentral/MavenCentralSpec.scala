@@ -116,7 +116,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
             URL.decode("https://repo1.maven.org/maven2/org/webjars/webjars-locator-core/0.52/webjars-locator-core-0.52-javadoc.jar").contains(doesExist),
           )
       ,
-      test("downloadAndExtractZip"):
+      test("downloadAndExtractZipWithCacheInfo"):
         val url = URL.decode("https://repo1.maven.org/maven2/com/jamesward/travis-central-test/0.0.15/travis-central-test-0.0.15.jar").toOption.get
         val tmpFile = Files.createTempDirectory("test").nn.toFile.nn
 
@@ -127,16 +127,57 @@ object MavenCentralSpec extends ZIOSpecDefault:
           )
         )
       ,
-      test("downloadAndExtractZipStreaming"):
+      test("downloadAndExtractZip"):
         val url = URL.decode("https://repo1.maven.org/maven2/com/jamesward/travis-central-test/0.0.15/travis-central-test-0.0.15.jar").toOption.get
         val tmpFile = Files.createTempDirectory("test-streaming").nn.toFile.nn
 
-        downloadAndExtractZipStreaming(url, tmpFile).as(
+        downloadAndExtractZip(url, tmpFile).as(
           assertTrue(
             tmpFile.list().nn.contains("META-INF"),
             tmpFile.toPath.resolve("META-INF/maven/com.jamesward/travis-central-test/pom.properties").toFile.length() == 118,
           )
         )
+      ,
+      test("downloadAndExtractZip - kotlin dokka javadoc"):
+        val url = URL.decode("https://repo1.maven.org/maven2/io/ktor/ktor-serialization-jvm/3.2.3/ktor-serialization-jvm-3.2.3-javadoc.jar").toOption.get
+        val tmpFile = Files.createTempDirectory("test-streaming-kotlin").nn.toFile.nn
+
+        downloadAndExtractZip(url, tmpFile).as(
+          assertTrue(
+            tmpFile.list().nn.contains("index.html"),
+          )
+        )
+      @@ TestAspect.timeout(30.seconds) @@ TestAspect.withLiveClock
+      ,
+      test("downloadAndExtractZip - 20 parallel"):
+        val urls = Seq(
+          "https://repo1.maven.org/maven2/com/jamesward/zio-mavencentral_3/0.0.21/zio-mavencentral_3-0.0.21-javadoc.jar",
+          "https://repo1.maven.org/maven2/dev/zio/zio_3/2.1.9/zio_3-2.1.9-javadoc.jar",
+          "https://repo1.maven.org/maven2/dev/zio/zio_2.13/2.1.9/zio_2.13-2.1.9-javadoc.jar",
+          "https://repo1.maven.org/maven2/io/ktor/ktor-io-jvm/3.2.3/ktor-io-jvm-3.2.3-javadoc.jar",
+          "https://repo1.maven.org/maven2/io/ktor/ktor-http-jvm/3.2.3/ktor-http-jvm-3.2.3-javadoc.jar",
+          "https://repo1.maven.org/maven2/io/ktor/ktor-utils-jvm/3.2.3/ktor-utils-jvm-3.2.3-javadoc.jar",
+          "https://repo1.maven.org/maven2/io/ktor/ktor-serialization-jvm/3.2.3/ktor-serialization-jvm-3.2.3-javadoc.jar",
+          "https://repo1.maven.org/maven2/io/ktor/ktor-client-core-jvm/3.2.3/ktor-client-core-jvm-3.2.3-javadoc.jar",
+          "https://repo1.maven.org/maven2/io/ktor/ktor-events-jvm/3.2.3/ktor-events-jvm-3.2.3-javadoc.jar",
+          "https://repo1.maven.org/maven2/io/ktor/ktor-websockets-jvm/3.2.3/ktor-websockets-jvm-3.2.3-javadoc.jar",
+          "https://repo1.maven.org/maven2/org/springframework/ai/spring-ai-mcp/1.0.1/spring-ai-mcp-1.0.1-javadoc.jar",
+          "https://repo1.maven.org/maven2/com/vaadin/vaadin-confirm-dialog-flow/24.9.0/vaadin-confirm-dialog-flow-24.9.0-javadoc.jar",
+          "https://repo1.maven.org/maven2/org/webjars/webjars-locator-lite/1.1.3/webjars-locator-lite-1.1.3-javadoc.jar",
+          "https://repo1.maven.org/maven2/org/webjars/webjars-locator-core/0.52/webjars-locator-core-0.52-javadoc.jar",
+          "https://repo1.maven.org/maven2/org/jsoup/jsoup/1.22.2/jsoup-1.22.2-javadoc.jar",
+          "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/2.0.17/slf4j-simple-2.0.17-javadoc.jar",
+          "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.17/slf4j-api-2.0.17-javadoc.jar",
+          "https://repo1.maven.org/maven2/dev/zio/zio-schema_3/1.8.3/zio-schema_3-1.8.3-javadoc.jar",
+          "https://repo1.maven.org/maven2/dev/zio/zio-streams_3/2.1.25/zio-streams_3-2.1.25-javadoc.jar",
+          "https://repo1.maven.org/maven2/dev/zio/zio-test_3/2.1.25/zio-test_3-2.1.25-javadoc.jar",
+        ).map(s => URL.decode(s).toOption.get)
+
+        ZIO.foreachPar(urls): url =>
+          val tmpFile = Files.createTempDirectory("test-parallel").nn.toFile.nn
+          downloadAndExtractZip(url, tmpFile)
+        .as(assertCompletes)
+      @@ TestAspect.timeout(1.minutes) @@ TestAspect.withLiveClock
       ,
       // note that on some networks all DNS requests are accepted and redirect to something like a captive portal, wtf
       test("requestWithFallbackurl"):
@@ -168,7 +209,7 @@ object MavenCentralSpec extends ZIOSpecDefault:
             myMavenMetadata.maybeLastModified.isDefined
           )
 
-    ).provide(Client.default.update(_ @@ ZClientAspect.requestLogging()), Scope.default),
+    ).provide(Client.default.update(_ @@ ZClientAspect.requestLogging())),
     suite("deploy")(
       test("fail verification"):
         val filename = "momentjs-exists.zip"

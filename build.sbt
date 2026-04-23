@@ -15,9 +15,7 @@ val zioVersion = "2.1.25"
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                 % zioVersion,
   "dev.zio" %% "zio-direct"          % "1.0.0-RC7",
-  "dev.zio" %% "zio-direct-streams"  % "1.0.0-RC7",
   "dev.zio" %% "zio-http"            % "3.10.1",
-  "dev.zio" %% "zio-streams-compress-zip" % "2.1.0",
   "dev.zio" %% "zio-schema-derivation" % "1.8.3",
 
   "org.scala-lang.modules" %% "scala-xml" % "2.4.0",
@@ -28,8 +26,6 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
   "dev.zio" %% "zio-test-magnolia"  % zioVersion % Test,
 )
-
-testFrameworks += new TestFramework("zio.test.sbt.ZTestFramework")
 
 fork := true
 
