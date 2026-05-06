@@ -7,10 +7,11 @@ scalaVersion := "3.8.3"
 scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
   "-language:strictEquality",
+  "-deprecation",
   // "-Xfatal-warnings", // not sure where it went
 )
 
-val zioVersion = "2.1.25"
+val zioVersion = "2.1.26"
 
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                 % zioVersion,

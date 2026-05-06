@@ -3,8 +3,8 @@ package com.jamesward.zio_mavencentral
 import zio.direct.*
 import zio.http.*
 import zio.schema.{Schema, derived}
-import zio.stream.{ZPipeline, ZSink, ZStream}
-import zio.{Cause, Chunk, Schedule, Scope, Trace, ZIO, ZLayer, durationInt}
+import zio.stream.{ZPipeline, ZSink}
+import zio.{Chunk, Schedule, Scope, Trace, ZIO, ZLayer, durationInt}
 
 import java.io.{File, IOException}
 import java.nio.file.Files
@@ -28,7 +28,7 @@ object MavenCentral:
     @targetName("slash")
     def /(artifactId: ArtifactId): Path = Path.root / groupId / artifactId
     // todo: more defensive
-    def asGroupArtifact: GroupArtifact =
+    private def asGroupArtifact: GroupArtifact =
       val parts = groupId.split('.')
       GroupArtifact(GroupId(parts.init.mkString(".")), ArtifactId(parts.last))
 
@@ -63,19 +63,20 @@ object MavenCentral:
   case class GroupIdNotFoundError(groupId: GroupId)
   case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
   case class NotFoundError(groupId: GroupId, artifactId: ArtifactId, version: Version)
-  case class UnknownError(response: Response) extends Throwable(response.status.text)
-  case class ParseError(t: Throwable) extends Throwable(t)
+  case class TemporaryServerError(response: Response) extends Throwable(s"${response.status.code}: ${response.status.text}")
+  private case class UnknownError(response: Response) extends Throwable(response.status.text)
+  private case class ParseError(t: Throwable) extends Throwable(t)
 
-  given Schema[GroupId] = Schema.primitive[String].transform(MavenCentral.GroupId.apply, _.toString)
-  given Schema[ArtifactId] = Schema.primitive[String].transform(MavenCentral.ArtifactId.apply, _.toString)
-  given Schema[Version] = Schema.primitive[String].transform(MavenCentral.Version.apply, _.toString)
+  given Schema[GroupId] = Schema.primitive[String].transform(MavenCentral.GroupId.apply, identity)
+  given Schema[ArtifactId] = Schema.primitive[String].transform(MavenCentral.ArtifactId.apply, identity)
+  given Schema[Version] = Schema.primitive[String].transform(MavenCentral.Version.apply, identity)
 
-  def stringToGroupArtifact(s: String): MavenCentral.GroupArtifact =
+  private def stringToGroupArtifact(s: String): MavenCentral.GroupArtifact =
     // todo: parse failure handling
     val parts = s.split(':')
     MavenCentral.GroupArtifact(MavenCentral.GroupId(parts(0)), MavenCentral.ArtifactId(parts(1)))
 
-  def groupArtifactToString(ga: MavenCentral.GroupArtifact): String = s"${ga.groupId}:${ga.artifactId}"
+  private def groupArtifactToString(ga: MavenCentral.GroupArtifact): String = s"${ga.groupId}:${ga.artifactId}"
 
   given Schema[MavenCentral.GroupArtifact] = Schema.primitive[String].transform(stringToGroupArtifact, groupArtifactToString)
 
@@ -130,7 +131,7 @@ object MavenCentral:
             client.batched(fallbackReq).map(_ -> fallbackReq.url)
 
   // Removes any versions found in this groupId
-  def searchArtifacts(groupId: GroupId): ZIO[Client, GroupIdNotFoundError | Throwable, WithCacheInfo[Seq[ArtifactId]]] =
+  def searchArtifacts(groupId: GroupId): ZIO[Client, GroupIdNotFoundError | TemporaryServerError | Throwable, WithCacheInfo[Seq[ArtifactId]]] =
     val path = artifactPath(groupId).addTrailingSlash
     val allFilesReq = Client.requestWithFallback(path).map(_._1)
     val groupArtifact = groupId.asGroupArtifact
@@ -149,12 +150,14 @@ object MavenCentral:
                   allFilesResp.header(Header.ETag)
                 )
           case _ =>
-            ZIO.fail(UnknownError(allFilesResp)).run
+            allFilesResp.status match
+              case status if status.isServerError => ZIO.fail(TemporaryServerError(allFilesResp)).run
+              case _ => ZIO.fail(UnknownError(allFilesResp)).run
     .flatten
 
 
   // newest first
-  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, WithCacheInfo[Seq[Version]]] =
+  def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, WithCacheInfo[Seq[Version]]] =
     defer:
       val metadata = mavenMetadata(groupId, artifactId).run
       val versions = metadata.value \ "versioning" \ "versions" \ "version"
@@ -178,10 +181,11 @@ object MavenCentral:
               ZIO.succeed(true).run
           case Status.NotModified => ZIO.succeed(false).run
           case Status.NotFound => ZIO.fail(maybeArtifactId.fold(GroupIdNotFoundError(groupId))(GroupIdOrArtifactIdNotFoundError(groupId, _))).run
-          case e => ZIO.fail(UnknownError(response)).run
+          case status if status.isServerError => ZIO.fail(TemporaryServerError(response)).run
+          case _ => ZIO.fail(UnknownError(response)).run
 
   // todo: potentially use maven-metadata.xml
-  def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, Option[Version]] =
+  def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, Option[Version]] =
     searchVersions(groupId, artifactId).map(_.value.headOption)
 
   def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, Throwable, Boolean] =
@@ -199,7 +203,7 @@ object MavenCentral:
       val (response, _) = Client.requestWithFallback(path, Method.HEAD).run
       response.status.isSuccess
 
-  def pom(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | Throwable, Elem] =
+  def pom(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | TemporaryServerError | Throwable, Elem] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version.pom"
       val (response, url) = Client.requestWithFallback(path, Method.GET).run
@@ -209,10 +213,12 @@ object MavenCentral:
           scala.xml.XML.loadString(body)
         case Status.NotFound =>
           ZIO.fail(NotFoundError(groupId, artifactId, version)).run
+        case status if status.isServerError =>
+          ZIO.fail(TemporaryServerError(response)).run
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | Throwable, WithCacheInfo[Elem]] =
+  def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, WithCacheInfo[Elem]] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
       val (response, url) = Client.requestWithFallback(path, Method.GET).run
@@ -226,32 +232,30 @@ object MavenCentral:
           )
         case Status.NotFound =>
           ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
+        case status if status.isServerError =>
+          ZIO.fail(TemporaryServerError(response)).run
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | Throwable, URL] =
+  private def artifactUrl(groupId: GroupId, artifactId: ArtifactId, version: Version)(filename: String): ZIO[Client, NotFoundError | TemporaryServerError | Throwable, URL] =
     defer:
-      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-javadoc.jar"
+      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / filename
       val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
       response.status match
         case status if status.isSuccess =>
           ZIO.succeed(url).run
         case Status.NotFound =>
           ZIO.fail(NotFoundError(groupId, artifactId, version)).run
+        case status if status.isServerError =>
+          ZIO.fail(TemporaryServerError(response)).run
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
-  def sourcesUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | Throwable, URL] =
-    defer:
-      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version-sources.jar"
-      val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
-      response.status match
-        case status if status.isSuccess =>
-          ZIO.succeed(url).run
-        case Status.NotFound =>
-          ZIO.fail(NotFoundError(groupId, artifactId, version)).run
-        case _ =>
-          ZIO.fail(UnknownError(response)).run
+  def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | TemporaryServerError | Throwable, URL] =
+    artifactUrl(groupId, artifactId, version)(s"$artifactId-$version-javadoc.jar")
+
+  def sourcesUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | TemporaryServerError | Throwable, URL] =
+    artifactUrl(groupId, artifactId, version)(s"$artifactId-$version-sources.jar")
 
   // Extract a downloaded zip file to a destination directory using java.util.zip.ZipFile
   // (random access, avoids the concurrency issues of streaming unarchivers under load).
@@ -282,8 +286,10 @@ object MavenCentral:
           ZIO.attemptBlockingIO(Files.createTempFile("mvncentral-dl-", ".zip").nn)
         )(path => ZIO.attemptBlockingIO(Files.deleteIfExists(path)).ignoreLogged).run
         val response = Client.streaming(Request.get(source)).run
-        if response.status.isError then
-          ZIO.fail(UnknownError(response)).run
+        response.status match
+          case status if status.isError && status.isServerError => ZIO.fail(TemporaryServerError(response)).run
+          case status if status.isError => ZIO.fail(UnknownError(response)).run
+          case _ => // success, continue
         response.body.asStream.run(ZSink.fromPath(tmpFile)).run
         val files = extractZipFile(tmpFile, destination).run
         (response, files)
@@ -307,9 +313,9 @@ object MavenCentral:
     object Sonatype:
       private val sonatypeUrl = URL.decode("https://central.sonatype.com").toOption.get
 
-      extension (s: String) def base64: String = java.util.Base64.getEncoder.encodeToString(s.getBytes)
+      extension (s: String) private def base64: String = java.util.Base64.getEncoder.encodeToString(s.getBytes)
 
-      def clientMiddleware(username: String, password: String)(client: Client): Client =
+      private def clientMiddleware(username: String, password: String)(client: Client): Client =
         val token = s"$username:$password".base64
 
         client
@@ -332,7 +338,7 @@ object MavenCentral:
             val client = ZIO.serviceWith[Client](clientMiddleware(username, password)).run
             Sonatype(client)
 
-    type DeploymentId = String
+    private type DeploymentId = String
 
     given CanEqual[DeploymentState, DeploymentState] = CanEqual.derived
 
@@ -359,7 +365,7 @@ object MavenCentral:
               val response = sonatype.client.post("/api/v1/publisher/upload")(body).run
               response.body.asString.run
 
-    case class StatusResponse(deploymentState: DeploymentState) derives Schema
+    private case class StatusResponse(deploymentState: DeploymentState) derives Schema
 
     def checkStatus(deploymentId: DeploymentId): ZIO[Sonatype, Throwable, DeploymentState] =
       ZIO.serviceWithZIO[Sonatype]:
@@ -367,11 +373,11 @@ object MavenCentral:
           ZIO.scoped:
             defer:
               val request = Request.post(s"/api/v1/publisher/status", Body.empty).addQueryParam("id", deploymentId)
-              val response = sonatype.client.request(request).run
+              val response = sonatype.client.batched(request).run
               val statusResponse = response.body.asJson[StatusResponse].run
               statusResponse.deploymentState
 
-    def publish(deploymentId: DeploymentId): ZIO[Sonatype, Throwable, Unit] =
+    private def publish(deploymentId: DeploymentId): ZIO[Sonatype, Throwable, Unit] =
       ZIO.serviceWithZIO[Sonatype]:
         sonatype =>
           ZIO.scoped:
