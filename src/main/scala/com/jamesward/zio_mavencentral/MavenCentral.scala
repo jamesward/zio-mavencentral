@@ -2,6 +2,7 @@ package com.jamesward.zio_mavencentral
 
 import zio.direct.*
 import zio.http.*
+import zio.http.codec.PathCodec
 import zio.schema.{Schema, derived}
 import zio.stream.{ZPipeline, ZSink}
 import zio.{Chunk, Schedule, Scope, Trace, ZIO, ZLayer, durationInt}
@@ -60,12 +61,46 @@ object MavenCentral:
 
   case class WithCacheInfo[A](value: A, maybeLastModified: Option[ZonedDateTime], maybeEtag: Option[Header.ETag])
 
+  /**
+   * Cache metadata extracted from an HTTP response when downloading a jar.
+   * Useful for implementing conditional `If-None-Match` / `If-Modified-Since`
+   * requests against Maven Central without re-fetching the body.
+   */
+  case class JarMeta(maybeLastModified: Option[ZonedDateTime], maybeEtag: Option[Header.ETag])
+
   case class GroupIdNotFoundError(groupId: GroupId)
   case class GroupIdOrArtifactIdNotFoundError(groupId: GroupId, artifactId: ArtifactId)
   case class NotFoundError(groupId: GroupId, artifactId: ArtifactId, version: Version)
+  /** No published versions for this `GroupArtifact` (Maven Central returned an
+   *  empty version list). Surfaced by [[latestOrFail]]. */
+  case class LatestNotFound(groupArtifact: GroupArtifact)
   case class TemporaryServerError(response: Response) extends Throwable(s"${response.status.code}: ${response.status.text}")
   private case class UnknownError(response: Response) extends Throwable(response.status.text)
   private case class ParseError(t: Throwable) extends Throwable(t)
+
+  /** Convenience constructor: `gav("org.foo", "bar", "1.2.3")`. */
+  def gav(groupId: String, artifactId: String, version: String): GroupArtifactVersion =
+    GroupArtifactVersion(GroupId(groupId), ArtifactId(artifactId), Version(version))
+
+  /**
+   * Retries a ZIO effect up to 2 additional times on `TemporaryServerError`
+   * (Maven Central 5xx) with exponential backoff starting at 1 second.
+   * Permanent errors (e.g. `NotFoundError`, 4xx) fail immediately.
+   *
+   * Use:
+   * {{{
+   *   import com.jamesward.zio_mavencentral.MavenCentral.retryOnServerError
+   *   MavenCentral.searchVersions(g, a).retryOnServerError
+   * }}}
+   */
+  extension [R, E, A](zio: ZIO[R, E, A])
+    def retryOnServerError: ZIO[R, E, A] =
+      zio.retry(
+        Schedule.recurWhile[E]:
+          case _: TemporaryServerError => true
+          case _                       => false
+        && Schedule.exponential(1.second) && Schedule.recurs(2)
+      )
 
   given Schema[GroupId] = Schema.primitive[String].transform(MavenCentral.GroupId.apply, identity)
   given Schema[ArtifactId] = Schema.primitive[String].transform(MavenCentral.ArtifactId.apply, identity)
@@ -188,6 +223,22 @@ object MavenCentral:
   def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, Option[Version]] =
     searchVersions(groupId, artifactId).map(_.value.headOption)
 
+  /**
+   * Resolve the latest published version for a `GroupArtifact`, with
+   * `retryOnServerError` and a typed failure channel. Equivalent to:
+   *   `latest(g, a).retryOnServerError.someOrFail(LatestNotFound(ga))`
+   * with throwables `orDie`'d. Convenient for callers that want a clean
+   * `ZIO[Client, GroupIdOrArtifactIdNotFoundError | LatestNotFound, Version]`.
+   */
+  def latestOrFail(groupArtifact: GroupArtifact):
+      ZIO[Client, GroupIdOrArtifactIdNotFoundError | LatestNotFound, Version] =
+    latest(groupArtifact.groupId, groupArtifact.artifactId)
+      .retryOnServerError
+      .catchAll:
+        case t: Throwable                        => ZIO.die(t)
+        case e: GroupIdOrArtifactIdNotFoundError => ZIO.fail(e)
+      .someOrFail(LatestNotFound(groupArtifact))
+
   def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, Throwable, Boolean] =
     defer:
       val metadata = mavenMetadata(groupId, artifactId).run
@@ -251,6 +302,10 @@ object MavenCentral:
         case _ =>
           ZIO.fail(UnknownError(response)).run
 
+  /** URL to the main `.jar` for a GAV. */
+  def jarUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | TemporaryServerError | Throwable, URL] =
+    artifactUrl(groupId, artifactId, version)(s"$artifactId-$version.jar")
+
   def javadocUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | TemporaryServerError | Throwable, URL] =
     artifactUrl(groupId, artifactId, version)(s"$artifactId-$version-javadoc.jar")
 
@@ -277,32 +332,71 @@ object MavenCentral:
               acc + entry.getName.nn
         .run
 
-  // Download a zip to a temporary file, extract it to `destination`, then delete the tmp file.
-  // The download step returns HTTP response headers for cache metadata extraction.
-  private def downloadAndExtract(source: URL, destination: File): ZIO[Client, Throwable, (Response, Set[String])] =
+  /**
+   * Download a jar (or any binary blob) from `source` to `target`, returning
+   * the HTTP cache metadata (`Last-Modified` / `ETag`).
+   *
+   * Streams the response body straight to disk via `ZSink.fromPath`; never
+   * materializes the full body in memory.
+   *
+   *  - 5xx responses fail with `TemporaryServerError` (retry-friendly via
+   *    `retryOnServerError`).
+   *  - Other non-success responses fail with an internal `UnknownError`
+   *    surfaced as a generic `Throwable`.
+   */
+  def downloadJar(source: URL, target: File): ZIO[Client, Throwable, JarMeta] =
     ZIO.scoped:
       defer:
-        val tmpFile = ZIO.acquireRelease(
-          ZIO.attemptBlockingIO(Files.createTempFile("mvncentral-dl-", ".zip").nn)
-        )(path => ZIO.attemptBlockingIO(Files.deleteIfExists(path)).ignoreLogged).run
         val response = Client.streaming(Request.get(source)).run
         response.status match
           case status if status.isError && status.isServerError => ZIO.fail(TemporaryServerError(response)).run
           case status if status.isError => ZIO.fail(UnknownError(response)).run
           case _ => // success, continue
-        response.body.asStream.run(ZSink.fromPath(tmpFile)).run
-        val files = extractZipFile(tmpFile, destination).run
-        (response, files)
+        response.body.asStream.run(ZSink.fromPath(target.toPath)).run
+        JarMeta(
+          response.header(Header.LastModified).map(_.value),
+          response.header(Header.ETag),
+        )
+
+  // Download a zip to a temporary file, extract it to `destination`, then delete the tmp file.
+  // The download step returns HTTP response headers for cache metadata extraction.
+  private def downloadAndExtract(source: URL, destination: File): ZIO[Client, Throwable, (JarMeta, Set[String])] =
+    ZIO.scoped:
+      defer:
+        val tmpFile = ZIO.acquireRelease(
+          ZIO.attemptBlockingIO(Files.createTempFile("mvncentral-dl-", ".zip").nn.toFile)
+        )(file => ZIO.attemptBlockingIO(Files.deleteIfExists(file.toPath)).ignoreLogged).run
+        val meta  = downloadJar(source, tmpFile).run
+        val files = extractZipFile(tmpFile.toPath, destination).run
+        (meta, files)
 
   // Download and extract a zip, returning the list of extracted files along with
   // Maven Central cache metadata (Last-Modified / ETag) from the HTTP response.
   def downloadAndExtractZip(source: URL, destination: File): ZIO[Client, Throwable, WithCacheInfo[Set[String]]] =
-    downloadAndExtract(source, destination).map: (response, files) =>
-      WithCacheInfo(
-        files,
-        response.header(Header.LastModified).map(_.value),
-        response.header(Header.ETag),
-      )
+    downloadAndExtract(source, destination).map: (meta, files) =>
+      WithCacheInfo(files, meta.maybeLastModified, meta.maybeEtag)
+
+  /**
+   * `zio-http` `PathCodec` instances for the GAV value types. Convenient for
+   * route definitions like `Method.GET / "files" / groupArtifactVersion / trailing`.
+   */
+  object Codecs:
+    val groupId: PathCodec[GroupId] =
+      PathCodec.string("groupId").transform(GroupId(_))(_.toString)
+
+    val artifactId: PathCodec[ArtifactId] =
+      PathCodec.string("artifactId").transform(ArtifactId(_))(_.toString)
+
+    val version: PathCodec[Version] =
+      PathCodec.string("version").transform(Version(_))(_.toString)
+
+    val groupArtifact: PathCodec[GroupArtifact] =
+      val base = groupId / artifactId
+      base.transform((g, a) => GroupArtifact(g, a))(ga => (ga.groupId, ga.artifactId))
+
+    val groupArtifactVersion: PathCodec[GroupArtifactVersion] =
+      val base = groupId / artifactId / version
+      base.transform((g, a, v) => GroupArtifactVersion(g, a, v))(gav => (gav.groupId, gav.artifactId, gav.version))
 
   object Deploy:
     import zio.http.Header.Authorization
