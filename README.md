@@ -1,7 +1,7 @@
 zio-mavencentral
 --------------------
 
-[![javadoc](https://javadoc.io/badge2/com.jamesward/zio-mavencentral_3/javadoc.svg)](https://www.javadocs.dev/com.jamesward/zio-mavencentral_3/latest)
+[![javadocs.dev](https://www.javadocs.dev/com.jamesward/zio-mavencentral_3/badge.svg)](https://www.javadocs.dev/com.jamesward/zio-mavencentral_3/latest)
 
 A ZIO 2 / Scala 3 toolkit for working with Maven Central:
 
