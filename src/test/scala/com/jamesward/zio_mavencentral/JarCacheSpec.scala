@@ -97,7 +97,7 @@ object JarCacheSpec extends ZIOSpecDefault:
               !hasNope,
               fooString == "<html>Foo</html>",
             )
-      body.provide(Client.default, Scope.default)
+      body.provide(Client.default)
     },
 
     test("entryNames lists all entries; filterEntryNames matches predicate") {
@@ -111,7 +111,7 @@ object JarCacheSpec extends ZIOSpecDefault:
               all == sampleEntries.keySet,
               htmls == Set("index.html", "pkg/Foo.html", "pkg/Bar.html", "pkg/sub/Baz.html"),
             )
-      body.provide(Client.default, Scope.default)
+      body.provide(Client.default)
     },
 
     test("readEntry on a missing path fails with JarEntryNotFound") {
@@ -122,7 +122,7 @@ object JarCacheSpec extends ZIOSpecDefault:
             val result = handle.readEntry("does-not-exist.html").either.run
             val expected = JarCache.JarEntryNotFound(gavA, "does-not-exist.html")
             assertTrue(result.left.toOption.contains(expected))
-      body.provide(Client.default, Scope.default)
+      body.provide(Client.default)
     },
 
     test("repeated get for the same GAV downloads only once") {
@@ -138,7 +138,7 @@ object JarCacheSpec extends ZIOSpecDefault:
               // Same handle instance returned on hit.
               (h1 eq h2) && (h2 eq h3),
             )
-      body.provide(Client.default, Scope.default)
+      body.provide(Client.default)
     },
 
     test("concurrent get for the same GAV deduplicates downloads") {
@@ -163,7 +163,7 @@ object JarCacheSpec extends ZIOSpecDefault:
                 ),
             Some(gate),
           ).run
-      body.provide(Client.default, Scope.default)
+      body.provide(Client.default)
     },
 
     test("get for a missing GAV fails with NotFoundError and is not cached") {
@@ -180,7 +180,7 @@ object JarCacheSpec extends ZIOSpecDefault:
               // A failure is not cached: a retry re-invokes the downloader.
               n == 2,
             )
-      body.provide(Client.default, Scope.default)
+      body.provide(Client.default)
     },
 
     test("size and totalBytes reflect cached entries") {
@@ -199,7 +199,7 @@ object JarCacheSpec extends ZIOSpecDefault:
               sizeAfter == 2,
               bytesAfter > 0L,
             )
-      body.provide(Client.default, Scope.default)
+      body.provide(Client.default)
     },
 
     test("contains returns true only after a successful get") {
@@ -210,7 +210,7 @@ object JarCacheSpec extends ZIOSpecDefault:
             cache.get(gavA).run
             val after = cache.contains(gavA).run
             assertTrue(!before, after)
-      body.provide(Client.default, Scope.default)
+      body.provide(Client.default)
     },
 
     test("ZipFile handles are closed when the cache scope finalizes") {
@@ -231,7 +231,7 @@ object JarCacheSpec extends ZIOSpecDefault:
 
           val readResult = handle.readEntry("pkg/Foo.html").exit.run
           assertTrue(readResult.isFailure)
-      body.provide(Client.default, Scope.default)
+      body.provide(Client.default)
     },
 
   ) @@ TestAspect.withLiveClock

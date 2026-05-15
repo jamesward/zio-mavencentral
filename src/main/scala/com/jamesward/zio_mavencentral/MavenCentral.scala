@@ -432,6 +432,12 @@ object MavenCentral:
             val client = ZIO.serviceWith[Client](clientMiddleware(username, password)).run
             Sonatype(client)
 
+      /** Build a Sonatype client from explicit credentials. Use this when
+       *  credentials don't come from `OSS_DEPLOY_USERNAME` /
+       *  `OSS_DEPLOY_PASSWORD` env vars (e.g. read from typed config). */
+      def fromCredentials(username: String, password: String): ZLayer[Client, Nothing, Sonatype] =
+        ZLayer.fromFunction((client: Client) => Sonatype(clientMiddleware(username, password)(client)))
+
     private type DeploymentId = String
 
     given CanEqual[DeploymentState, DeploymentState] = CanEqual.derived

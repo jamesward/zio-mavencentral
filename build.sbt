@@ -31,7 +31,13 @@ libraryDependencies ++= Seq(
 
 fork := true
 
-javaOptions += "-Djava.net.preferIPv4Stack=true"
+javaOptions ++= Seq(
+  "-Djava.net.preferIPv4Stack=true",
+  // JDK 25: suppress sun.misc.Unsafe / restricted-method warnings
+  // emitted by upstream libs (scala-library, netty-common).
+  "--enable-native-access=ALL-UNNAMED",
+  "--sun-misc-unsafe-memory-access=allow",
+)
 
 licenses := Seq("MIT License" -> url("https://opensource.org/licenses/MIT"))
 
