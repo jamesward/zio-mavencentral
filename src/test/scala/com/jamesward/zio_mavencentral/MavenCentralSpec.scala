@@ -3,7 +3,7 @@ package com.jamesward.zio_mavencentral
 import MavenCentral.{*, given}
 import zio.*
 import zio.direct.*
-import zio.http.{Client, Path, URL, ZClientAspect}
+import zio.http.{Client, Path, Response, Status, URL, ZClientAspect}
 import zio.test.*
 
 import java.nio.file.Files
@@ -208,6 +208,24 @@ object MavenCentralSpec extends ZIOSpecDefault:
             (myMavenMetadata.value \ "groupId").text == "com.jamesward",
             myMavenMetadata.maybeLastModified.isDefined
           )
+      ,
+      // Maven Central rate-limits with 429, which is in the 4xx range so
+      // `Status.isServerError` is false. Before the fix, our error mapper
+      // treated 429 as UnknownError and `retryOnServerError` ignored it.
+      // This test asserts the new contract: a TemporaryServerError wrapping
+      // a 429 response is retried.
+      test("retryOnServerError retries TemporaryServerError wrapping a 429"):
+        for
+          counter  <- Ref.make(0)
+          response  = Response.status(Status.TooManyRequests)
+          effect    = counter.updateAndGet(_ + 1).flatMap: n =>
+                        if n < 3 then ZIO.fail(TemporaryServerError(response))
+                        else ZIO.succeed("ok")
+          fiber    <- effect.retryOnServerError.fork
+          _        <- TestClock.adjust(10.seconds)
+          result   <- fiber.join
+          attempts <- counter.get
+        yield assertTrue(result == "ok", attempts == 3)
 
     ).provide(Client.default.update(_ @@ ZClientAspect.requestLogging())),
     suite("deploy")(

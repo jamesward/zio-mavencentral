@@ -28,10 +28,6 @@ object MavenCentral:
   extension (groupId: GroupId)
     @targetName("slash")
     def /(artifactId: ArtifactId): Path = Path.root / groupId / artifactId
-    // todo: more defensive
-    private def asGroupArtifact: GroupArtifact =
-      val parts = groupId.split('.')
-      GroupArtifact(GroupId(parts.init.mkString(".")), ArtifactId(parts.last))
 
   opaque type ArtifactId = String
   object ArtifactId:
@@ -74,9 +70,19 @@ object MavenCentral:
   /** No published versions for this `GroupArtifact` (Maven Central returned an
    *  empty version list). Surfaced by [[latestOrFail]]. */
   case class LatestNotFound(groupArtifact: GroupArtifact)
+  /** A transient HTTP failure that's worth retrying — 5xx server errors *or*
+   *  429 Too Many Requests (Maven Central throttles aggressive clients with
+   *  429s; treating them as retryable lets [[retryOnServerError]] back off). */
   case class TemporaryServerError(response: Response) extends Throwable(s"${response.status.code}: ${response.status.text}")
   private case class UnknownError(response: Response) extends Throwable(response.status.text)
   private case class ParseError(t: Throwable) extends Throwable(t)
+
+  // Promote a non-success response to either a TemporaryServerError (retryable)
+  // or an UnknownError (terminal). Centralizing the rule means new retryable
+  // status codes only need to be added in one place.
+  private def temporaryOrUnknown(response: Response): Throwable =
+    if response.status.isServerError || response.status.code == 429 then TemporaryServerError(response)
+    else UnknownError(response)
 
   /** Convenience constructor: `gav("org.foo", "bar", "1.2.3")`. */
   def gav(groupId: String, artifactId: String, version: String): GroupArtifactVersion =
@@ -165,13 +171,36 @@ object MavenCentral:
             val fallbackReq = req.updateURL(_ => fallbackBaseUrl.addPath(path))
             client.batched(fallbackReq).map(_ -> fallbackReq.url)
 
+  // When a groupId path is *also* an artifact path (e.g. org.webjars:npm lives
+  // at /org/webjars/npm/, sibling to every artifact in the org.webjars.npm
+  // group), the directory listing includes the artifact's version subdirs as
+  // pseudo-artifacts. Fetch the maven-metadata.xml at the group path to find
+  // out which subdir names are actually versions of the group-as-artifact.
+  //
+  // 404 ⇒ no metadata file at the group path (typical for pure groupIds like
+  // org.springframework). Other errors (5xx / 429) propagate so the caller
+  // can retry — previously these were silently swallowed via
+  // `.orElseSucceed(Seq.empty)`, causing every version directory to leak
+  // through as a fake artifact whenever Maven Central rate-limited us.
+  private def versionsAtGroupPath(groupId: GroupId): ZIO[Client, TemporaryServerError | Throwable, Seq[Version]] =
+    defer:
+      val path = artifactPath(groupId) / "maven-metadata.xml"
+      val (response, _) = Client.requestWithFallback(path, Method.GET).run
+      response.status match
+        case status if status.isSuccess =>
+          val body = response.body.asString.run
+          val xml  = scala.xml.XML.loadString(body)
+          (xml \ "versioning" \ "versions" \ "version").map(n => Version(n.text)).toSeq
+        case Status.NotFound =>
+          ZIO.succeed(Seq.empty[Version]).run
+        case _ =>
+          ZIO.fail(temporaryOrUnknown(response)).run
+
   // Removes any versions found in this groupId
   def searchArtifacts(groupId: GroupId): ZIO[Client, GroupIdNotFoundError | TemporaryServerError | Throwable, WithCacheInfo[Seq[ArtifactId]]] =
     val path = artifactPath(groupId).addTrailingSlash
     val allFilesReq = Client.requestWithFallback(path).map(_._1)
-    val groupArtifact = groupId.asGroupArtifact
-    val versions = searchVersions(groupArtifact.groupId, groupArtifact.artifactId).map(_.value).orElseSucceed(Seq.empty[Version])
-    allFilesReq.zipWithPar(versions):
+    allFilesReq.zipWithPar(versionsAtGroupPath(groupId)):
       (allFilesResp, versions) =>
         allFilesResp.status match
           case Status.NotFound =>
@@ -185,9 +214,7 @@ object MavenCentral:
                   allFilesResp.header(Header.ETag)
                 )
           case _ =>
-            allFilesResp.status match
-              case status if status.isServerError => ZIO.fail(TemporaryServerError(allFilesResp)).run
-              case _ => ZIO.fail(UnknownError(allFilesResp)).run
+            ZIO.fail(temporaryOrUnknown(allFilesResp))
     .flatten
 
 
@@ -216,8 +243,7 @@ object MavenCentral:
               ZIO.succeed(true).run
           case Status.NotModified => ZIO.succeed(false).run
           case Status.NotFound => ZIO.fail(maybeArtifactId.fold(GroupIdNotFoundError(groupId))(GroupIdOrArtifactIdNotFoundError(groupId, _))).run
-          case status if status.isServerError => ZIO.fail(TemporaryServerError(response)).run
-          case _ => ZIO.fail(UnknownError(response)).run
+          case _ => ZIO.fail(temporaryOrUnknown(response)).run
 
   // todo: potentially use maven-metadata.xml
   def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, Option[Version]] =
@@ -264,10 +290,8 @@ object MavenCentral:
           scala.xml.XML.loadString(body)
         case Status.NotFound =>
           ZIO.fail(NotFoundError(groupId, artifactId, version)).run
-        case status if status.isServerError =>
-          ZIO.fail(TemporaryServerError(response)).run
         case _ =>
-          ZIO.fail(UnknownError(response)).run
+          ZIO.fail(temporaryOrUnknown(response)).run
 
   def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[Client, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, WithCacheInfo[Elem]] =
     defer:
@@ -283,10 +307,8 @@ object MavenCentral:
           )
         case Status.NotFound =>
           ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
-        case status if status.isServerError =>
-          ZIO.fail(TemporaryServerError(response)).run
         case _ =>
-          ZIO.fail(UnknownError(response)).run
+          ZIO.fail(temporaryOrUnknown(response)).run
 
   private def artifactUrl(groupId: GroupId, artifactId: ArtifactId, version: Version)(filename: String): ZIO[Client, NotFoundError | TemporaryServerError | Throwable, URL] =
     defer:
@@ -297,10 +319,8 @@ object MavenCentral:
           ZIO.succeed(url).run
         case Status.NotFound =>
           ZIO.fail(NotFoundError(groupId, artifactId, version)).run
-        case status if status.isServerError =>
-          ZIO.fail(TemporaryServerError(response)).run
         case _ =>
-          ZIO.fail(UnknownError(response)).run
+          ZIO.fail(temporaryOrUnknown(response)).run
 
   /** URL to the main `.jar` for a GAV. */
   def jarUri(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[Client, NotFoundError | TemporaryServerError | Throwable, URL] =
@@ -349,8 +369,7 @@ object MavenCentral:
       defer:
         val response = Client.streaming(Request.get(source)).run
         response.status match
-          case status if status.isError && status.isServerError => ZIO.fail(TemporaryServerError(response)).run
-          case status if status.isError => ZIO.fail(UnknownError(response)).run
+          case status if status.isError => ZIO.fail(temporaryOrUnknown(response)).run
           case _ => // success, continue
         response.body.asStream.run(ZSink.fromPath(target.toPath)).run
         JarMeta(
