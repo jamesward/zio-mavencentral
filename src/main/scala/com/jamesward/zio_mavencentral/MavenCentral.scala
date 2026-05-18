@@ -1,15 +1,19 @@
 package com.jamesward.zio_mavencentral
 
+import org.bouncycastle.bcpg.{ArmoredOutputStream, BCPGOutputStream, HashAlgorithmTags}
+import org.bouncycastle.openpgp.operator.jcajce.{JcaKeyFingerprintCalculator, JcaPGPContentSignerBuilder, JcePBESecretKeyDecryptorBuilder}
+import org.bouncycastle.openpgp.{PGPPrivateKey, PGPPublicKey, PGPSecretKeyRing, PGPSignature, PGPSignatureGenerator}
 import zio.direct.*
 import zio.http.*
 import zio.http.codec.PathCodec
 import zio.schema.{Schema, derived}
 import zio.stream.{ZPipeline, ZSink}
-import zio.{Chunk, Schedule, Scope, Trace, ZIO, ZLayer, durationInt}
+import zio.{Chunk, ChunkBuilder, IO, Schedule, Scope, Trace, ZIO, ZLayer, durationInt}
 
 import java.io.{File, IOException}
 import java.nio.file.Files
 import java.time.ZonedDateTime
+import java.util.Base64
 import scala.annotation.{targetName, unused}
 import scala.util.matching.Regex
 import scala.xml.Elem
@@ -526,3 +530,56 @@ object MavenCentral:
                 MavenCentral.Deploy.publish(deploymentId).run
               else
                 ZIO.fail(RuntimeException(s"Deployment failed with status $status")).run
+
+  trait Signer:
+    def ascSign(toSign: Chunk[Byte]): IO[Throwable, Option[Chunk[Byte]]]
+
+  object Signer:
+    def make(gpgKey: String, gpgPass: Option[String]): ZLayer[Any, Throwable, Signer] =
+      // Parse the key material once; build a fresh, stateful PGPSignatureGenerator
+      // per signing call so concurrent callers don't share its internal digest state.
+      ZLayer.fromZIO:
+        ZIO.attempt:
+          val keyBytes = Base64.getDecoder.decode(gpgKey)
+          val secretKeyRing = PGPSecretKeyRing(keyBytes, JcaKeyFingerprintCalculator())
+          val pass = gpgPass.getOrElse("").toCharArray
+          val privKey = secretKeyRing.getSecretKey.extractPrivateKey(JcePBESecretKeyDecryptorBuilder().build(pass))
+          val publicKey = secretKeyRing.getPublicKey()
+          SignerLive(publicKey, privKey)
+
+
+  class SignerLive(publicKey: PGPPublicKey, privKey: PGPPrivateKey) extends Signer:
+
+    private def signError(e: Throwable): Throwable =
+      RuntimeException(s"Signing failed: ${e.getMessage}", e)
+
+    private final class ChunkBuilderOutputStream(builder: ChunkBuilder[Byte]) extends java.io.OutputStream:
+      override def write(b: Int): Unit =
+        builder += b.toByte
+
+      override def write(b: Array[Byte], off: Int, len: Int): Unit =
+        var i = off
+        val end = off + len
+        while i < end do
+          builder += b(i)
+          i += 1
+
+    override def ascSign(toSign: Chunk[Byte]): IO[Throwable, Option[Chunk[Byte]]] =
+      // The result chunk MUST be read after the streams are closed:
+      // ArmoredOutputStream writes the trailing CRC and end-of-armor
+      // marker on close(), and BCPGOutputStream may buffer partial
+      // packet data. Reading `builder.result()` before the scope
+      // releases produced a truncated, unverifiable signature.
+      ZIO.attempt(ChunkBuilder.make[Byte]()).flatMap: builder =>
+        ZIO.scoped:
+          defer:
+            val signerBuilder = JcaPGPContentSignerBuilder(publicKey.getAlgorithm, HashAlgorithmTags.SHA256)
+            val sGen = PGPSignatureGenerator(signerBuilder, publicKey)
+            ZIO.attempt(sGen.init(PGPSignature.BINARY_DOCUMENT, privKey)).run
+            val rawOut = ZIO.fromAutoCloseable(ZIO.attempt(ChunkBuilderOutputStream(builder))).run
+            val armor = ZIO.fromAutoCloseable(ZIO.attempt(ArmoredOutputStream(rawOut))).run
+            val bOut = ZIO.fromAutoCloseable(ZIO.attempt(BCPGOutputStream(armor))).run
+            ZIO.attempt(sGen.update(toSign.toArray)).run
+            ZIO.attempt(sGen.generate().encode(bOut)).run
+        .as(Some(builder.result()))
+      .mapError(signError)

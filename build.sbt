@@ -20,6 +20,8 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-http"            % "3.11.1",
   "dev.zio" %% "zio-schema-derivation" % "1.8.5",
 
+  "org.bouncycastle" % "bcpg-jdk18on" % "1.84",
+
   "org.scala-lang.modules" %% "scala-xml" % "2.4.0",
 
   "de.sciss" %% "semverfi" % "0.3.0",
