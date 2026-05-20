@@ -180,17 +180,23 @@ object MavenCentralSpec extends ZIOSpecDefault:
       @@ TestAspect.timeout(1.minutes) @@ TestAspect.withLiveClock
       ,
       // note that on some networks all DNS requests are accepted and redirect to something like a captive portal, wtf
-      test("requestWithFallbackurl"):
-        val artifactUrl = URL.decode("https://zxcvasdf123124zxcv.com/").toOption.get
-        val fallbackArtifactUrl = URL.decode("https://repo1.maven.org/maven2/").toOption.get
-        // bug in zio-direct:
-        // assertTrue(response.status.isSuccess)
-        // Exception occurred while executing macro expansion.
-        // java.lang.Exception: Expected an expression. This is a partially applied Term. Try eta-expanding the term first.
-        Client.requestWithFallback(Path.decode("com/jamesward/maven-metadata.xml"), primaryBaseUrl = artifactUrl, fallbackBaseUrl = fallbackArtifactUrl).map:
-          (response, _) =>
-            assertTrue(response.status.isSuccess)
+      test("MavenCentralRepo falls over from a bad mirror to a working one"):
+        // Custom mirror list: a bogus first mirror, then the real primary.
+        // The breaker for the first should trip and the second should serve.
+        val badMirror = URL.decode("https://zxcvasdf123124zxcv.com/").toOption.get
+        val goodMirror = URL.decode("https://repo1.maven.org/maven2/").toOption.get
+        val customRepo = MavenCentralRepo.custom(
+          mirrors = List(badMirror, goodMirror),
+          maxFailures = 1,
+          resetMin = 1.hour,
+          resetMax = 1.hour,
+        )
 
+        ZIO.serviceWithZIO[MavenCentralRepo]: repo =>
+          repo.request(Path.decode("com/jamesward/maven-metadata.xml")).map:
+            (response, _) =>
+              assertTrue(response.status.isSuccess)
+        .provideSome[Client](customRepo)
       ,
       test("pom"):
         defer:
@@ -208,26 +214,8 @@ object MavenCentralSpec extends ZIOSpecDefault:
             (myMavenMetadata.value \ "groupId").text == "com.jamesward",
             myMavenMetadata.maybeLastModified.isDefined
           )
-      ,
-      // Maven Central rate-limits with 429, which is in the 4xx range so
-      // `Status.isServerError` is false. Before the fix, our error mapper
-      // treated 429 as UnknownError and `retryOnServerError` ignored it.
-      // This test asserts the new contract: a TemporaryServerError wrapping
-      // a 429 response is retried.
-      test("retryOnServerError retries TemporaryServerError wrapping a 429"):
-        for
-          counter  <- Ref.make(0)
-          response  = Response.status(Status.TooManyRequests)
-          effect    = counter.updateAndGet(_ + 1).flatMap: n =>
-                        if n < 3 then ZIO.fail(TemporaryServerError(response))
-                        else ZIO.succeed("ok")
-          fiber    <- effect.retryOnServerError.fork
-          _        <- TestClock.adjust(10.seconds)
-          result   <- fiber.join
-          attempts <- counter.get
-        yield assertTrue(result == "ok", attempts == 3)
 
-    ).provide(Client.default.update(_ @@ ZClientAspect.requestLogging())),
+    ).provide(Client.default.update(_ @@ ZClientAspect.requestLogging()), MavenCentralRepo.live),
     suite("deploy")(
       test("fail verification"):
         val filename = "momentjs-exists.zip"

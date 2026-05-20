@@ -71,9 +71,9 @@ object JarCacheSpec extends ZIOSpecDefault:
    *  call-count Ref to the test body. The cache's scope cleans up
    *  ZipFile handles; we also recursively delete the tmp dir. */
   private def withCache[E, A](
-    body: (JarCache, Ref[Map[GroupArtifactVersion, Int]]) => ZIO[Client & Scope, E, A],
+    body: (JarCache, Ref[Map[GroupArtifactVersion, Int]]) => ZIO[Client & MavenCentral.MavenCentralRepo & Scope, E, A],
     gate: Option[Promise[Nothing, Unit]] = None,
-  ): ZIO[Client & Scope, E, A] =
+  ): ZIO[Client & MavenCentral.MavenCentralRepo & Scope, E, A] =
     defer:
       val callCount = Ref.make(Map.empty[GroupArtifactVersion, Int]).run
       val tmp = ZIO.attemptBlockingIO(Files.createTempDirectory("jar-cache-test").nn.toFile).orDie.run
@@ -97,7 +97,7 @@ object JarCacheSpec extends ZIOSpecDefault:
               !hasNope,
               fooString == "<html>Foo</html>",
             )
-      body.provide(Client.default)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
     test("entryNames lists all entries; filterEntryNames matches predicate") {
@@ -111,7 +111,7 @@ object JarCacheSpec extends ZIOSpecDefault:
               all == sampleEntries.keySet,
               htmls == Set("index.html", "pkg/Foo.html", "pkg/Bar.html", "pkg/sub/Baz.html"),
             )
-      body.provide(Client.default)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
     test("readEntry on a missing path fails with JarEntryNotFound") {
@@ -122,7 +122,7 @@ object JarCacheSpec extends ZIOSpecDefault:
             val result = handle.readEntry("does-not-exist.html").either.run
             val expected = JarCache.JarEntryNotFound(gavA, "does-not-exist.html")
             assertTrue(result.left.toOption.contains(expected))
-      body.provide(Client.default)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
     test("repeated get for the same GAV downloads only once") {
@@ -138,7 +138,7 @@ object JarCacheSpec extends ZIOSpecDefault:
               // Same handle instance returned on hit.
               (h1 eq h2) && (h2 eq h3),
             )
-      body.provide(Client.default)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
     test("concurrent get for the same GAV deduplicates downloads") {
@@ -163,7 +163,7 @@ object JarCacheSpec extends ZIOSpecDefault:
                 ),
             Some(gate),
           ).run
-      body.provide(Client.default)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
     test("get for a missing GAV fails with NotFoundError and is not cached") {
@@ -180,7 +180,7 @@ object JarCacheSpec extends ZIOSpecDefault:
               // A failure is not cached: a retry re-invokes the downloader.
               n == 2,
             )
-      body.provide(Client.default)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
     test("size and totalBytes reflect cached entries") {
@@ -199,7 +199,7 @@ object JarCacheSpec extends ZIOSpecDefault:
               sizeAfter == 2,
               bytesAfter > 0L,
             )
-      body.provide(Client.default)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
     test("contains returns true only after a successful get") {
@@ -210,7 +210,7 @@ object JarCacheSpec extends ZIOSpecDefault:
             cache.get(gavA).run
             val after = cache.contains(gavA).run
             assertTrue(!before, after)
-      body.provide(Client.default)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
     test("ZipFile handles are closed when the cache scope finalizes") {
@@ -231,7 +231,7 @@ object JarCacheSpec extends ZIOSpecDefault:
 
           val readResult = handle.readEntry("pkg/Foo.html").exit.run
           assertTrue(readResult.isFailure)
-      body.provide(Client.default)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
   ) @@ TestAspect.withLiveClock

@@ -1,6 +1,6 @@
 package com.jamesward.zio_mavencentral
 
-import com.jamesward.zio_mavencentral.MavenCentral.{GroupArtifactVersion, JarMeta, NotFoundError, retryOnServerError}
+import com.jamesward.zio_mavencentral.MavenCentral.{GroupArtifactVersion, JarMeta, MavenCentralRepo, NotFoundError}
 import zio.*
 import zio.concurrent.ConcurrentMap
 import zio.direct.*
@@ -43,7 +43,7 @@ final class JarCache private (
   cacheDir: File,
   jars: ConcurrentMap[GroupArtifactVersion, JarCache.JarHandle],
   pendingFetches: ConcurrentMap[GroupArtifactVersion, Promise[NotFoundError, JarCache.JarHandle]],
-  download: (GroupArtifactVersion, File) => ZIO[Client, NotFoundError, JarMeta],
+  download: (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, NotFoundError, JarMeta],
   label: String,
 ):
   /**
@@ -53,7 +53,7 @@ final class JarCache private (
    * Cache miss → at most one fiber per GAV downloads + opens; concurrent
    *              callers for the same GAV await the same `Promise`.
    */
-  def get(gav: GroupArtifactVersion): ZIO[Client, NotFoundError, JarCache.JarHandle] =
+  def get(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, NotFoundError, JarCache.JarHandle] =
     defer:
       jars.get(gav).run match
         case Some(handle) =>
@@ -71,7 +71,7 @@ final class JarCache private (
                   pendingFetches.remove(gav) *> myPromise.done(exit)
                 .run
 
-  private def fetchAndOpen(gav: GroupArtifactVersion): ZIO[Client, NotFoundError, JarCache.JarHandle] =
+  private def fetchAndOpen(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, NotFoundError, JarCache.JarHandle] =
     defer:
       val jarFile = File(cacheDir, JarCache.jarFileName(gav))
       ZIO.logInfo(s"Downloading $label jar: $gav").run
@@ -174,16 +174,24 @@ object JarCache:
    * (or `sourcesUri`), then streams the jar bytes to `target` via
    * [[MavenCentral.downloadJar]].
    *
+   * URL resolution goes through [[MavenCentralRepo]], so transient
+   * upstream failures (5xx / 429 / 403) trigger mirror fallback and
+   * count toward each mirror's circuit breaker. There is no per-call
+   * retry — failure of the resolve step is surfaced directly.
+   *
+   * The download step (`MavenCentral.downloadJar`) hits the resolved URL
+   * directly via [[zio.http.Client]], so the returned function still
+   * requires `Client` in its environment.
+   *
    * Production path; tests pass a different downloader that copies a
    * fixture jar into place without doing any network work.
    */
   def httpDownloader(
-    uri: GroupArtifactVersion => ZIO[Client, NotFoundError | MavenCentral.TemporaryServerError | Throwable, URL],
-  ): (GroupArtifactVersion, File) => ZIO[Client, NotFoundError, JarMeta] =
+    uri: GroupArtifactVersion => ZIO[MavenCentralRepo, NotFoundError | MavenCentral.TemporaryServerError | Throwable, URL],
+  ): (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, NotFoundError, JarMeta] =
     (gav, target) =>
-      val resolveUrl: ZIO[Client, NotFoundError, URL] =
+      val resolveUrl: ZIO[MavenCentralRepo, NotFoundError, URL] =
         uri(gav)
-          .retryOnServerError
           .catchAll:
             case t: Throwable      => ZIO.die(t)
             case nf: NotFoundError => ZIO.fail(nf)
@@ -199,7 +207,7 @@ object JarCache:
    */
   def make(
     cacheDir: File,
-    download: (GroupArtifactVersion, File) => ZIO[Client, NotFoundError, JarMeta],
+    download: (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, NotFoundError, JarMeta],
     label: String = "javadoc",
   ): ZIO[Scope, Nothing, JarCache] =
     defer:
