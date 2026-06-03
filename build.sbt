@@ -2,7 +2,7 @@ organization := "com.jamesward"
 
 name := "zio-mavencentral"
 
-scalaVersion := "3.8.3"
+scalaVersion := "3.8.4"
 
 scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
