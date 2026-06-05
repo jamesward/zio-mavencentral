@@ -5,6 +5,7 @@ import zio.*
 import zio.concurrent.ConcurrentMap
 import zio.direct.*
 import zio.http.{Client, URL}
+import zio.stream.ZStream
 
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -139,6 +140,30 @@ object JarCache:
     /** Read one entry as a UTF-8 string. */
     def readEntryString(path: String): IO[JarEntryNotFound, String] =
       readEntry(path).map(new String(_, StandardCharsets.UTF_8))
+
+    /**
+     * Stream one entry's bytes without buffering the whole entry in heap.
+     *
+     * Backed by the `ZipFile`'s `InputStream` for the requested entry,
+     * read in `chunkSize` byte chunks. The `InputStream` is owned by an
+     * internal scope and closed when the stream terminates (success,
+     * failure, or interrupt). Use this for serving large jar entries
+     * over HTTP — `readEntry` allocates a single `byte[]` of the entry's
+     * full uncompressed size, which is fine for small files but scales
+     * poorly under concurrency on multi-MB entries.
+     */
+    def streamEntry(path: String, chunkSize: Int = 64 * 1024): ZStream[Any, JarEntryNotFound, Byte] =
+      ZStream.unwrap:
+        ZIO.attemptBlockingIO(zipFile.getEntry(path)).orDie.map: entry =>
+          if entry == null then
+            ZStream.fail(JarEntryNotFound(gav, path))
+          else
+            ZStream
+              .fromInputStreamScoped(
+                ZIO.fromAutoCloseable(ZIO.attemptBlockingIO(zipFile.getInputStream(entry).nn)),
+                chunkSize,
+              )
+              .orDie
 
     /** All entry names (files + directories). Does not decompress any data. */
     def entryNames: UIO[Set[String]] =

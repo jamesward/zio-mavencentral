@@ -125,6 +125,34 @@ object JarCacheSpec extends ZIOSpecDefault:
       body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
+    test("streamEntry reads bytes without materializing the whole entry") {
+      val body = ZIO.scoped:
+        withCache: (cache, _) =>
+          defer:
+            val handle = cache.get(gavA).run
+            // Use a tiny chunkSize to make sure the result is reassembled
+            // from multiple chunks rather than a single read.
+            val asString =
+              handle
+                .streamEntry("pkg/Foo.html", chunkSize = 4)
+                .via(zio.stream.ZPipeline.utf8Decode)
+                .runFold("")(_ + _)
+                .run
+            assertTrue(asString == "<html>Foo</html>")
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("streamEntry on a missing path fails with JarEntryNotFound") {
+      val body = ZIO.scoped:
+        withCache: (cache, _) =>
+          defer:
+            val handle = cache.get(gavA).run
+            val result = handle.streamEntry("does-not-exist.html").runCollect.either.run
+            val expected = JarCache.JarEntryNotFound(gavA, "does-not-exist.html")
+            assertTrue(result.left.toOption.contains(expected))
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
     test("repeated get for the same GAV downloads only once") {
       val body = ZIO.scoped:
         withCache: (cache, callCount) =>
