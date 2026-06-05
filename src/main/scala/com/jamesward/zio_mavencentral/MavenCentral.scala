@@ -474,8 +474,36 @@ object MavenCentral:
    * Download a jar (or any binary blob) from `source` to `target`, returning
    * the HTTP cache metadata (`Last-Modified` / `ETag`).
    *
-   * Streams the response body straight to disk via `ZSink.fromPath`; never
-   * materializes the full body in memory.
+   * Streams the response body to disk via `ZSink.fromPath`, with an
+   * intermediate `ZPipeline.rechunk(64 KB)` to bound chunk size before
+   * the sink sees them.
+   *
+   * Why the rechunk is necessary
+   * ----------------------------
+   * `zio-http`'s `AsyncBodyReader` sits in `Buffering` state between
+   * `Client.streaming` returning (headers received) and user code
+   * materializing `response.body.asStream` (which calls `connect`
+   * under the hood). While buffering, every `HttpContent` frame is
+   * appended to an internal `mutable.ArrayBuilder.ofByte`, and
+   * `ctx.read()` is called to pull more — the buffer grows unbounded.
+   *
+   * On `connect`, the entire accumulated buffer is flushed as a
+   * **single** `Chunk.ByteArray`. For a multi-MB jar arriving while
+   * ZIO is still doing scope/queue/fiber-scheduling setup between
+   * `Client.streaming` and `.run(sink)`, that single Chunk can be
+   * tens of MB. `ZSink.fromPath` then calls `byteChunk.toArray`
+   * (allocating a fresh `byte[]` of the chunk's full size) before
+   * the `FileChannel.write` — which on a memory-tight deploy is the
+   * difference between OOM and not.
+   *
+   * `ZPipeline.rechunk(N)` slices any incoming chunk into ≤ N-byte
+   * chunks before the sink sees them. The slicing is O(1) per slice
+   * (Chunk slices are views over the same backing array), so it
+   * doesn't introduce extra copies; it just stops `Chunk.toArray`
+   * from being asked to allocate more than 64 KB at a time. The
+   * giant upstream Chunk still exists briefly until the pipeline
+   * drains it, but the doubled-allocation that was tipping us over
+   * is gone.
    *
    *  - 5xx / 429 / 403 responses fail with `TemporaryServerError`.
    *  - Other non-success responses fail with an internal `UnknownError`
@@ -494,7 +522,10 @@ object MavenCentral:
         response.status match
           case status if status.isError => ZIO.fail(temporaryOrUnknown(response)).run
           case _ => // success, continue
-        response.body.asStream.run(ZSink.fromPath(target.toPath)).run
+        response.body.asStream
+          .via(ZPipeline.rechunk(64 * 1024))
+          .run(ZSink.fromPath(target.toPath))
+          .run
         JarMeta(
           response.header(Header.LastModified).map(_.value),
           response.header(Header.ETag),
