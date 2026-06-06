@@ -55,6 +55,7 @@ object JarCacheSpec extends ZIOSpecDefault:
   private val gavA = gav("g", "a", "1")
   private val gavB = gav("g", "b", "1")
   private val gavMissing = gav("g", "missing", "1")
+  private val gavCorrupt = gav("g", "corrupt", "1")
 
   private val sampleEntries: Map[String, Array[Byte]] = Map(
     "index.html"        -> "<html>index</html>".getBytes(StandardCharsets.UTF_8),
@@ -64,8 +65,31 @@ object JarCacheSpec extends ZIOSpecDefault:
     "element-list"      -> "pkg\npkg.sub\n".getBytes(StandardCharsets.UTF_8),
   )
 
+  /** Bytes that look like they came from a botched upstream publish:
+   *  a non-empty file (so `Content-Length` matches what the server
+   *  promised) of all zeros — no zip End-of-Central-Directory record,
+   *  so `ZipFile`'s constructor fails with `ZipException`. This is
+   *  exactly the shape of the real corrupt
+   *  `webvr-polyfill-dpdb/1.0.7.jar` we observed in production. */
+  private val corruptBytes: Array[Byte] = new Array[Byte](16561)
+
   private val fixtures: GroupArtifactVersion => Option[Map[String, Array[Byte]]] =
     g => if g == gavMissing then None else Some(sampleEntries)
+
+  /** Like [[fakeDownloader]], but writes raw bytes without zipping —
+   *  used to simulate Maven Central serving a corrupt jar. */
+  private def corruptDownloader(
+    callCount: Ref[Map[GroupArtifactVersion, Int]],
+  ): (GroupArtifactVersion, File) => ZIO[Client, NotFoundError, JarMeta] =
+    (gav, target) =>
+      defer:
+        callCount.update(m => m.updated(gav, m.getOrElse(gav, 0) + 1)).run
+        ZIO.attemptBlockingIO:
+          target.getParentFile.mkdirs()
+          val out = java.io.FileOutputStream(target)
+          try out.write(corruptBytes) finally out.close()
+        .orDie.run
+        JarMeta(None, None)
 
   /** Provides a fresh JarCache (rooted in a unique tmp dir) plus the
    *  call-count Ref to the test body. The cache's scope cleans up
@@ -496,6 +520,50 @@ object JarCacheSpec extends ZIOSpecDefault:
             assertTrue(
               readResult.isFailure, // defect from `acquire`
             )
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("a corrupt upstream jar fails with UpstreamCorruptError, deletes the file, and is not cached") {
+      // Mirrors the real production case (webvr-polyfill-dpdb/1.0.7) where
+      // Maven Central returned a 200 OK with `application/java-archive`
+      // and matching upstream checksums, but the bytes were all zeros —
+      // not a valid zip. Pre-fix this escaped as an unhandled defect → 500.
+      // The new behavior fails with a typed UpstreamCorruptError that the
+      // caller can map to a 422.
+      val body = ZIO.scoped:
+        defer:
+          val callCount = Ref.make(Map.empty[GroupArtifactVersion, Int]).run
+          val tmp = ZIO.attemptBlockingIO(Files.createTempDirectory("jar-cache-corrupt-test").nn.toFile).orDie.run
+          ZIO.addFinalizer(ZIO.attempt(recursivelyDelete(tmp)).ignore).run
+          val cache = JarCache.make(tmp, corruptDownloader(callCount)).run
+
+          val first = cache.get(gavCorrupt).either.run
+
+          // The on-disk file should have been deleted as part of the failure
+          // path so it doesn't pile up alongside legitimate entries.
+          val onDiskFile = new File(tmp, JarCache.jarFileName(gavCorrupt))
+          val onDiskExists = ZIO.attempt(onDiskFile.exists()).orDie.run
+
+          // The corrupt entry should not have been registered in the cache.
+          val sized = cache.size.run
+          val cached = cache.contains(gavCorrupt).run
+
+          // A retry should re-invoke the downloader (corruption isn't cached).
+          val second = cache.get(gavCorrupt).either.run
+          val downloads = callCount.get.map(_.getOrElse(gavCorrupt, 0)).run
+
+          assertTrue(
+            // Typed error rather than a defect or a NotFoundError.
+            first.left.toOption.exists {
+              case JarCache.UpstreamCorruptError(g, _, _) => g == gavCorrupt
+              case _                                       => false
+            },
+            second.left.toOption.exists(_.isInstanceOf[JarCache.UpstreamCorruptError]),
+            !onDiskExists,
+            sized == 0,
+            !cached,
+            downloads == 2,
+          )
       body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 

@@ -77,7 +77,7 @@ import java.util.zip.ZipFile
 final class JarCache private (
   cacheDir: File,
   jars: ConcurrentMap[GroupArtifactVersion, JarCache.CacheEntry],
-  pendingFetches: ConcurrentMap[GroupArtifactVersion, Promise[NotFoundError, JarCache.JarHandle]],
+  pendingFetches: ConcurrentMap[GroupArtifactVersion, Promise[NotFoundError | JarCache.UpstreamCorruptError, JarCache.JarHandle]],
   download: (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, NotFoundError, JarMeta],
   label: String,
   warmIdleTtl: Duration,
@@ -91,14 +91,22 @@ final class JarCache private (
    *     handle will transparently re-promote it to Warm.
    *   - Cache miss: at most one fiber per GAV downloads + opens; concurrent
    *     callers for the same GAV await the same `Promise`.
+   *   - Cache miss with corrupt upstream bytes: fails with
+   *     [[JarCache.UpstreamCorruptError]] (not [[NotFoundError]]).
+   *     Maven Central is rare-but-not-impossibly known to host malformed
+   *     jars from botched publishes (zero-byte payloads, truncated
+   *     archives, etc.). Distinguishing this case lets callers map it
+   *     to a 422-style HTTP response rather than a 404 (the artifact
+   *     does exist, it's just unprocessable) or — worse — letting it
+   *     escape as an unhandled defect → 500.
    */
-  def get(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, NotFoundError, JarCache.JarHandle] =
+  def get(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, NotFoundError | JarCache.UpstreamCorruptError, JarCache.JarHandle] =
     defer:
       jars.get(gav).run match
         case Some(entry) =>
           JarCache.JarHandle(entry)
         case None =>
-          val myPromise    = Promise.make[NotFoundError, JarCache.JarHandle].run
+          val myPromise    = Promise.make[NotFoundError | JarCache.UpstreamCorruptError, JarCache.JarHandle].run
           val maybeWaiting = pendingFetches.putIfAbsent(gav, myPromise).run
           maybeWaiting match
             case Some(inFlight) =>
@@ -118,8 +126,16 @@ final class JarCache private (
    * (typically the same fiber, immediately) will bump `refCount` via
    * `acquire` for its own operation. If no such caller arrives before
    * `warmIdleTtl` elapses, the sweeper will demote it.
+   *
+   * If the downloaded bytes don't parse as a valid zip (Maven Central
+   * occasionally hosts malformed jars from botched publishes — e.g.
+   * a 16 KB file that's all zero bytes, with a 200 OK and matching
+   * MD5/SHA1 checksums on the upstream side), we delete the corrupt
+   * file from disk, log a warning, and fail with
+   * [[JarCache.UpstreamCorruptError]] so the route handler can
+   * distinguish "cannot be parsed" from "doesn't exist."
    */
-  private def fetchAndOpen(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, NotFoundError, JarCache.JarHandle] =
+  private def fetchAndOpen(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, NotFoundError | JarCache.UpstreamCorruptError, JarCache.JarHandle] =
     defer:
       val jarFile = File(cacheDir, JarCache.jarFileName(gav))
       ZIO.logInfo(s"Downloading $label jar: $gav").run
@@ -127,7 +143,21 @@ final class JarCache private (
       val sizeBytes        = ZIO.attempt(jarFile.length()).orDie.run
       ZIO.logInfo(s"Downloaded $label jar: $gav size=${sizeBytes / 1024}KB duration=${duration.toMillis}ms").run
 
-      val zipFile        = ZIO.attemptBlockingIO(ZipFile(jarFile)).orDie.run
+      val zipFile =
+        ZIO.attemptBlockingIO(ZipFile(jarFile)).foldZIO(
+          {
+            case e: java.util.zip.ZipException =>
+              ZIO.logWarning(s"Corrupt $label jar from upstream: $gav (size=${sizeBytes}B): ${e.getMessage}") *>
+                ZIO.attempt(jarFile.delete()).ignore *>
+                ZIO.fail(JarCache.UpstreamCorruptError(gav, sizeBytes, Option(e.getMessage).getOrElse("zip parse failed").nn))
+            case e =>
+              // Any other I/O failure (FS broken, OOM, etc.) is a defect —
+              // not something a route handler can meaningfully recover from.
+              ZIO.die(e)
+          },
+          zip => ZIO.succeed(zip),
+        ).run
+
       val state          = Ref.make(JarCache.EntryState(refCount = 0, zip = Some(zipFile))).run
       val promotionMutex = Semaphore.make(1).run
       val lastAccess     = Ref.make(java.lang.System.nanoTime()).run
@@ -205,6 +235,22 @@ object JarCache:
   /** Failure type for entry lookups. Distinct from `NotFoundError`,
    *  which signals the *jar* was not found upstream. */
   case class JarEntryNotFound(gav: GroupArtifactVersion, path: String)
+
+  /**
+   * Failure type for [[JarCache.get]] when the upstream `.jar` was
+   * downloaded successfully (HTTP 200, expected size) but its bytes
+   * cannot be parsed as a valid zip — e.g. a botched publish that
+   * left a zero-byte payload at rest in the upstream repository.
+   * Distinct from `NotFoundError` (the artifact does exist; it just
+   * isn't a usable jar). Callers typically map this to a 422
+   * "Unprocessable" HTTP response.
+   *
+   * @param gav         the artifact whose jar is corrupt
+   * @param sizeBytes   the size of the file that was downloaded
+   * @param reason      the underlying `ZipException` message (e.g.
+   *                    "zip END header not found")
+   */
+  case class UpstreamCorruptError(gav: GroupArtifactVersion, sizeBytes: Long, reason: String)
 
   /**
    * Internal hot-path state for a [[CacheEntry]]. Held in a single `Ref`
@@ -590,7 +636,7 @@ object JarCache:
       .orDie.run
 
       val jars    = ConcurrentMap.empty[GroupArtifactVersion, CacheEntry].run
-      val pending = ConcurrentMap.empty[GroupArtifactVersion, Promise[NotFoundError, JarHandle]].run
+      val pending = ConcurrentMap.empty[GroupArtifactVersion, Promise[NotFoundError | UpstreamCorruptError, JarHandle]].run
       val cache   = new JarCache(cacheDir, jars, pending, download, label, warmIdleTtl, coldIdleTtl)
 
       // Sweeper runs for the life of the cache scope; the close-all
