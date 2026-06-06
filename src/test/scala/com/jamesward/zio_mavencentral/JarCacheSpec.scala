@@ -81,6 +81,28 @@ object JarCacheSpec extends ZIOSpecDefault:
       val cache = JarCache.make(tmp, fakeDownloader(fixtures, callCount, gate)).run
       body(cache, callCount).run
 
+  /** Variant of [[withCache]] with explicit warm-idle and sweep-interval
+   *  durations, for tests that exercise the warm/cold sweeper. The
+   *  defaults in `JarCache.make` are tuned for production (30 min /
+   *  1 min); tests need much smaller values. */
+  private def withTunedCache[E, A](
+    warmIdleTtl: Duration,
+    sweepInterval: Duration,
+  )(
+    body: (JarCache, Ref[Map[GroupArtifactVersion, Int]]) => ZIO[Client & MavenCentral.MavenCentralRepo & Scope, E, A],
+  ): ZIO[Client & MavenCentral.MavenCentralRepo & Scope, E, A] =
+    defer:
+      val callCount = Ref.make(Map.empty[GroupArtifactVersion, Int]).run
+      val tmp = ZIO.attemptBlockingIO(Files.createTempDirectory("jar-cache-test").nn.toFile).orDie.run
+      ZIO.addFinalizer(ZIO.attempt(recursivelyDelete(tmp)).ignore).run
+      val cache = JarCache.make(
+        tmp,
+        fakeDownloader(fixtures, callCount),
+        warmIdleTtl   = warmIdleTtl,
+        sweepInterval = sweepInterval,
+      ).run
+      body(cache, callCount).run
+
   def spec = suite("JarCache")(
 
     test("get downloads, opens, and reads entries via random access") {
@@ -157,14 +179,17 @@ object JarCacheSpec extends ZIOSpecDefault:
       val body = ZIO.scoped:
         withCache: (cache, callCount) =>
           defer:
-            val h1 = cache.get(gavA).run
-            val h2 = cache.get(gavA).run
-            val h3 = cache.get(gavA).run
-            val n  = callCount.get.map(_.getOrElse(gavA, 0)).run
+            cache.get(gavA).run
+            cache.get(gavA).run
+            cache.get(gavA).run
+            val n      = callCount.get.map(_.getOrElse(gavA, 0)).run
+            val sized  = cache.size.run
             assertTrue(
               n == 1,
-              // Same handle instance returned on hit.
-              (h1 eq h2) && (h2 eq h3),
+              // Cache has a single entry; the handles returned above all
+              // delegate to the same `CacheEntry` (handles themselves are
+              // lightweight pointers and are no longer reference-equal).
+              sized == 1,
             )
       body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
@@ -184,10 +209,12 @@ object JarCacheSpec extends ZIOSpecDefault:
                 gate.succeed(()).run
                 val handles = fibers.join.run
                 val n = callCount.get.map(_.getOrElse(gavA, 0)).run
+                val sized = cache.size.run
                 assertTrue(
                   n == 1,
                   handles.size == 16,
-                  handles.forall(_ eq handles.head),
+                  // All callers see the single cached entry.
+                  sized == 1,
                 ),
             Some(gate),
           ).run
@@ -259,6 +286,111 @@ object JarCacheSpec extends ZIOSpecDefault:
 
           val readResult = handle.readEntry("pkg/Foo.html").exit.run
           assertTrue(readResult.isFailure)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("warmCount tracks resident ZipFile handles separately from size") {
+      // After a fresh fetch, the entry is warm (open ZipFile resident).
+      val body = ZIO.scoped:
+        withTunedCache(warmIdleTtl = 1.hour, sweepInterval = 1.hour): (cache, _) =>
+          defer:
+            cache.get(gavA).run
+            cache.get(gavB).run
+            val s    = cache.size.run
+            val warm = cache.warmCount.run
+            assertTrue(s == 2, warm == 2)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("entries demote to cold after warmIdleTtl elapses with no access") {
+      // Tiny idle TTL + tight sweep so the test doesn't have to wait long.
+      // After fetching a jar and then idling for > warmIdleTtl, the
+      // sweeper should close its ZipFile (warmCount → 0) but keep the
+      // on-disk file (size unchanged).
+      val body = ZIO.scoped:
+        withTunedCache(warmIdleTtl = 100.millis, sweepInterval = 50.millis): (cache, _) =>
+          defer:
+            cache.get(gavA).run
+            // Wait long enough for at least one sweep after the TTL.
+            ZIO.sleep(400.millis).run
+            val s    = cache.size.run
+            val warm = cache.warmCount.run
+            assertTrue(s == 1, warm == 0)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("a cold entry re-promotes to warm on next access without re-downloading") {
+      val body = ZIO.scoped:
+        withTunedCache(warmIdleTtl = 100.millis, sweepInterval = 50.millis): (cache, callCount) =>
+          defer:
+            // Warm the entry, then let it go cold.
+            val handle = cache.get(gavA).run
+            ZIO.sleep(400.millis).run
+            val warmAfterIdle = cache.warmCount.run
+            // Touch the entry: should re-promote without invoking the
+            // downloader again.
+            val foo = handle.readEntryString("pkg/Foo.html").run
+            val warmAfterAccess = cache.warmCount.run
+            val n = callCount.get.map(_.getOrElse(gavA, 0)).run
+            assertTrue(
+              warmAfterIdle == 0,
+              warmAfterAccess == 1,
+              n == 1, // no re-download
+              foo == "<html>Foo</html>",
+            )
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("idle TTL resets on access") {
+      // Access the entry inside the idle window; it must stay warm.
+      val body = ZIO.scoped:
+        withTunedCache(warmIdleTtl = 300.millis, sweepInterval = 50.millis): (cache, _) =>
+          defer:
+            val handle = cache.get(gavA).run
+            // Touch the handle every 100ms for ~500ms (well past one TTL
+            // worth of idle time, but never actually idle for 300ms).
+            ZIO.foreachDiscard(1 to 5): _ =>
+              handle.hasEntry("index.html") *> ZIO.sleep(100.millis)
+            .run
+            val warmDuringTouch = cache.warmCount.run
+            // Now stop touching and let it go cold.
+            ZIO.sleep(500.millis).run
+            val warmAfterIdle = cache.warmCount.run
+            assertTrue(warmDuringTouch == 1, warmAfterIdle == 0)
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("an in-flight stream blocks demotion until it completes") {
+      // The sweeper must not close a ZipFile that an in-flight reader
+      // still holds. We start a stream, let the sweeper run several
+      // times while the stream is active, then let the stream complete
+      // and check that demotion happens after.
+      val body = ZIO.scoped:
+        withTunedCache(warmIdleTtl = 50.millis, sweepInterval = 25.millis): (cache, _) =>
+          defer:
+            val handle = cache.get(gavA).run
+            // `streamEntry`'s scope keeps the entry's refCount at 1
+            // for the lifetime of the consumer. Run the consumer
+            // slowly (with a delay between elements) so the sweeper has
+            // multiple chances to attempt demotion while we're holding.
+            val streamFiber =
+              handle
+                .streamEntry("pkg/Foo.html", chunkSize = 1)
+                .schedule(zio.Schedule.fixed(20.millis))
+                .runDrain
+                .fork
+                .run
+            // Let the sweeper run a few times during the stream.
+            ZIO.sleep(200.millis).run
+            val warmDuringStream = cache.warmCount.run
+            // Wait for the stream to finish, then for one more sweep.
+            streamFiber.join.run
+            ZIO.sleep(150.millis).run
+            val warmAfterStream = cache.warmCount.run
+            assertTrue(
+              warmDuringStream == 1, // refCount > 0 blocked demotion
+              warmAfterStream == 0,  // refCount == 0; demoted
+            )
       body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
