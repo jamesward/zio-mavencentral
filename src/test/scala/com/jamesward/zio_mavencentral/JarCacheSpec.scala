@@ -88,6 +88,7 @@ object JarCacheSpec extends ZIOSpecDefault:
   private def withTunedCache[E, A](
     warmIdleTtl: Duration,
     sweepInterval: Duration,
+    coldIdleTtl: Option[Duration] = None,
   )(
     body: (JarCache, Ref[Map[GroupArtifactVersion, Int]]) => ZIO[Client & MavenCentral.MavenCentralRepo & Scope, E, A],
   ): ZIO[Client & MavenCentral.MavenCentralRepo & Scope, E, A] =
@@ -99,6 +100,7 @@ object JarCacheSpec extends ZIOSpecDefault:
         tmp,
         fakeDownloader(fixtures, callCount),
         warmIdleTtl   = warmIdleTtl,
+        coldIdleTtl   = coldIdleTtl,
         sweepInterval = sweepInterval,
       ).run
       body(cache, callCount).run
@@ -390,6 +392,109 @@ object JarCacheSpec extends ZIOSpecDefault:
             assertTrue(
               warmDuringStream == 1, // refCount > 0 blocked demotion
               warmAfterStream == 0,  // refCount == 0; demoted
+            )
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("coldIdleTtl=None never evicts cold entries (default behavior)") {
+      // With coldIdleTtl unset, an entry that has gone cold and stayed
+      // idle indefinitely keeps its on-disk file and remains in the
+      // cache map. Re-promotion still works without re-download.
+      val body = ZIO.scoped:
+        withTunedCache(warmIdleTtl = 50.millis, sweepInterval = 25.millis): (cache, callCount) =>
+          defer:
+            val handle = cache.get(gavA).run
+            // Wait long enough for many sweep passes after the warm TTL.
+            ZIO.sleep(500.millis).run
+            val sized       = cache.size.run
+            val warm        = cache.warmCount.run
+            val downloads1  = callCount.get.map(_.getOrElse(gavA, 0)).run
+            // Touch the entry; it must still be the same cached entry
+            // (no re-download).
+            val foo         = handle.readEntryString("pkg/Foo.html").run
+            val downloads2  = callCount.get.map(_.getOrElse(gavA, 0)).run
+            assertTrue(
+              sized == 1,         // entry still in the cache
+              warm == 0,          // demoted to cold
+              downloads1 == 1,    // single original download
+              downloads2 == 1,    // no re-download triggered by the touch
+              foo == "<html>Foo</html>",
+            )
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("coldIdleTtl evicts cold entries; re-get re-downloads") {
+      // With coldIdleTtl set short, an idle cold entry is fully evicted:
+      // removed from the cache map, on-disk file deleted. A subsequent
+      // get for the same GAV re-runs the downloader.
+      val body = ZIO.scoped:
+        withTunedCache(
+          warmIdleTtl   = 50.millis,
+          sweepInterval = 25.millis,
+          coldIdleTtl   = Some(150.millis),
+        ): (cache, callCount) =>
+          defer:
+            cache.get(gavA).run
+            // After warmIdleTtl + coldIdleTtl + a sweep tick, the entry
+            // should be evicted and removed from the map.
+            ZIO.sleep(500.millis).run
+            val sizedAfter      = cache.size.run
+            val warmAfter       = cache.warmCount.run
+            val downloadsBefore = callCount.get.map(_.getOrElse(gavA, 0)).run
+            // Re-`get` triggers a full cache miss, which re-downloads
+            // the jar (callCount increments).
+            cache.get(gavA).run
+            val downloadsAfter  = callCount.get.map(_.getOrElse(gavA, 0)).run
+            assertTrue(
+              sizedAfter == 0,         // entry was removed
+              warmAfter == 0,
+              downloadsBefore == 1,    // first miss
+              downloadsAfter == 2,     // second miss: re-download
+            )
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("access during the cold window resets the idle timer and prevents eviction") {
+      val body = ZIO.scoped:
+        withTunedCache(
+          warmIdleTtl   = 50.millis,
+          sweepInterval = 25.millis,
+          coldIdleTtl   = Some(150.millis),
+        ): (cache, callCount) =>
+          defer:
+            val handle = cache.get(gavA).run
+            // Touch the handle every 50ms for ~400ms — never idle for the
+            // full coldIdleTtl. Each touch forces a brief warm period
+            // (refCount + lastAccess update); the sweeper may demote
+            // between touches but must NOT evict.
+            ZIO.foreachDiscard(1 to 8): _ =>
+              handle.hasEntry("index.html") *> ZIO.sleep(50.millis)
+            .run
+            val sized      = cache.size.run
+            val downloads  = callCount.get.map(_.getOrElse(gavA, 0)).run
+            assertTrue(
+              sized == 1,        // entry still cached
+              downloads == 1,    // never re-downloaded
+            )
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("a JarHandle held across an eviction fails loudly on next operation") {
+      // Callers are expected to re-`get` a fresh handle after eviction.
+      // Operations on the stale handle die with a defect mentioning
+      // both shutdown and cold-eviction.
+      val body = ZIO.scoped:
+        withTunedCache(
+          warmIdleTtl   = 50.millis,
+          sweepInterval = 25.millis,
+          coldIdleTtl   = Some(150.millis),
+        ): (cache, _) =>
+          defer:
+            val handle = cache.get(gavA).run
+            ZIO.sleep(500.millis).run // long enough for warm-then-cold-then-evict
+            val readResult = handle.readEntry("pkg/Foo.html").exit.run
+            assertTrue(
+              readResult.isFailure, // defect from `acquire`
             )
       body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },

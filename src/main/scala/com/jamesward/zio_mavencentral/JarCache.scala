@@ -33,14 +33,21 @@ import java.util.zip.ZipFile
  * Entries enter Warm on the first access (cache miss → download → open)
  * and on any subsequent access while Cold. A periodic sweeper demotes
  * Warm entries to Cold once they have not been accessed for
- * [[warmIdleTtl]]. The on-disk file persists as long as the cache itself
- * does — there is no disk-side eviction; process restart is the natural
- * reset.
+ * [[warmIdleTtl]].
+ *
+ * If [[coldIdleTtl]] is set, the same sweeper also evicts Cold entries
+ * that have not been accessed for at least that long: the entry is
+ * removed from the cache and the on-disk `.jar` file is deleted. Future
+ * `get` calls for the same GAV are full cache misses (re-download from
+ * upstream). When `coldIdleTtl` is `None`, on-disk files persist for
+ * the life of the cache and a process restart is the only natural
+ * disk-side reset.
  *
  * This is the model that fits caches dominated by long-tail diversity
  * with a stable hot set: the popular working set stays warm with no
  * per-request open cost, and rarely-touched entries stop pinning heap
- * after `warmIdleTtl` without losing the on-disk download.
+ * after `warmIdleTtl` (and stop pinning disk after `coldIdleTtl`)
+ * without losing the on-disk download for genuinely hot GAVs.
  *
  * Concurrency
  * -----------
@@ -59,6 +66,11 @@ import java.util.zip.ZipFile
  *   - A reader's modify wins first: `refCount > 0`; the sweeper observes
  *     this and does nothing this round.
  *
+ * Cold-eviction takes the entry's promotion mutex, ensuring no in-flight
+ * `Cold → Warm` promotion is racing with the on-disk file delete. Any
+ * `JarHandle` still held by a caller against an evicted entry will fail
+ * loudly on its next operation; callers are expected to re-`get` the GAV.
+ *
  * There is no window in which the sweeper closes a `ZipFile` while an
  * in-flight read holds it.
  */
@@ -69,6 +81,7 @@ final class JarCache private (
   download: (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, NotFoundError, JarMeta],
   label: String,
   warmIdleTtl: Duration,
+  coldIdleTtl: Option[Duration],
 ):
   /**
    * Get (or fetch-and-open) the cached jar for `gav`.
@@ -146,16 +159,32 @@ final class JarCache private (
     jars.get(gav).map(_.isDefined)
 
   /**
-   * Sweeper body: scans every entry once and demotes any that have been
-   * idle for at least `warmIdleTtl`. Returns the number of entries
-   * demoted in this pass — useful for logging and tests.
+   * Sweeper body: scans every entry once. Demotes any warm entry that
+   * has been idle for at least `warmIdleTtl` (closing its `ZipFile`),
+   * and — if `coldIdleTtl` is set — evicts any cold entry that has been
+   * idle for at least that long (deleting its on-disk `.jar` and
+   * removing it from the cache map). Returns `(demoted, evicted)`
+   * counts for this pass — useful for logging and tests.
    */
-  private[zio_mavencentral] def sweep: UIO[Int] =
-    val ttlNanos = warmIdleTtl.toNanos
+  private[zio_mavencentral] def sweep: UIO[(Int, Int)] =
+    val warmTtlNanos    = warmIdleTtl.toNanos
+    val coldTtlNanosOpt = coldIdleTtl.map(_.toNanos)
     jars.toChunk.flatMap: kvs =>
       val now = java.lang.System.nanoTime()
-      ZIO.foreach(kvs)((_, e) => e.tryDemote(now, ttlNanos, label))
-        .map(_.count(identity))
+      ZIO.foreach(kvs): (gav, entry) =>
+        defer:
+          val demoted = entry.tryDemote(now, warmTtlNanos, label).run
+          val evicted =
+            coldTtlNanosOpt match
+              case Some(ttl) =>
+                val didEvict = entry.tryEvict(now, ttl, label).run
+                if didEvict then jars.remove(gav).run
+                didEvict
+              case None =>
+                false
+          (demoted, evicted)
+      .map: results =>
+        (results.count(_._1), results.count(_._2))
 
   /**
    * Cache-shutdown finalizer. Closes every entry's `ZipFile` (if warm)
@@ -208,7 +237,8 @@ object JarCache:
     lastAccess: Ref[Long],
   ):
     /**
-     * Volatile flag: set to true by [[shutdown]] to prevent any further
+     * Volatile flag: set to true by [[shutdown]] (cache-wide close) or by
+     * [[tryEvict]] (per-entry cold-eviction) to prevent any further
      * promotion. A `Ref[Boolean]` would also work but a plain
      * `AtomicBoolean` keeps the read off the ZIO runtime on the hot
      * acquire path.
@@ -227,7 +257,9 @@ object JarCache:
      * state and proceed.
      *
      * Failure modes are all defects (`die`):
-     *   - Cache shut down: the operator misused a closed cache.
+     *   - Entry has been closed (cache shutdown or cold-eviction): the
+     *     caller should re-`get` the GAV from the cache to obtain a
+     *     fresh handle.
      *   - `ZipFile` constructor I/O failure: the on-disk file is corrupt
      *     or the FS is broken; not something a caller can recover from.
      */
@@ -235,12 +267,13 @@ object JarCache:
       ZIO.acquireRelease(
         // Acquire: timestamp + atomically read-or-bump under state.modify.
         defer:
-          // Refuse to acquire on a shut-down cache. This catches the rare
-          // case where someone holds a `JarHandle` past the cache's scope
-          // closure; without it we'd happily re-open a fresh `ZipFile`
-          // against a file the caller is no longer entitled to use.
+          // Refuse to acquire on a closed entry. This catches both the
+          // app-shutdown case and the cold-evicted case; without it we'd
+          // happily try to re-open a fresh `ZipFile` against a file the
+          // caller is no longer entitled to use (and which, after
+          // eviction, has been deleted from disk anyway).
           if closedFlag.get() then
-            ZIO.dieMessage(s"JarCache entry $gav used after cache shutdown").run
+            ZIO.dieMessage(s"JarCache entry $gav used after close (cache shutdown or cold eviction)").run
 
           lastAccess.set(java.lang.System.nanoTime()).run
           val maybeWarmZip =
@@ -314,6 +347,49 @@ object JarCache:
               true
             case None =>
               false
+
+    /**
+     * Sweeper hook: try to evict this entry entirely (delete the on-disk
+     * `.jar` and mark the slot closed) if it has been cold and idle for
+     * at least `idleTtlNanos`. Returns `true` iff this call performed an
+     * eviction.
+     *
+     * Eviction is gated by `promotionMutex` so that a fiber currently
+     * promoting Cold→Warm can't open a fresh `ZipFile` against a file
+     * we're about to delete. We re-check `state` and `closedFlag` inside
+     * the mutex because another sweep pass (or another fiber) may have
+     * promoted or evicted in the meantime.
+     *
+     * After eviction:
+     *   - `closedFlag` is set, so any caller still holding a `JarHandle`
+     *     to this entry will fail loudly on its next operation. They
+     *     should re-`get` the GAV from the cache to fetch a fresh entry.
+     *   - The on-disk file is deleted. The next cache miss for this GAV
+     *     re-downloads from upstream.
+     *   - The caller is responsible for removing this entry from the
+     *     cache's `jars` map (the entry doesn't have a back-reference to
+     *     the map itself).
+     */
+    private[zio_mavencentral] def tryEvict(now: Long, idleTtlNanos: Long, label: String): UIO[Boolean] =
+      defer:
+        val isIdle = (now - lastAccess.get.run) > idleTtlNanos
+        if !isIdle then false
+        else
+          // Single-flight against any promote() that's racing with us.
+          // Promote takes the same mutex; we win → it sees closedFlag set
+          // when it next reads and dies cleanly (the caller will re-get).
+          // It wins → we re-check inside the mutex and back off.
+          promotionMutex.withPermit(
+            defer:
+              val s = state.get.run
+              if s.refCount == 0 && s.zip.isEmpty && !closedFlag.get() then
+                closedFlag.set(true)
+                ZIO.logInfo(s"Evicting cold $label jar: $gav").run
+                ZIO.attempt(file.delete()).ignoreLogged.run
+                true
+              else
+                false
+          ).run
 
     /**
      * Cache-shutdown hook: close any resident `ZipFile` and mark this
@@ -481,16 +557,30 @@ object JarCache:
    *                        being accessed before the sweeper demotes it
    *                        to cold and closes its `ZipFile`. The
    *                        sliding window resets on every operation.
-   * @param sweepInterval   How often the demotion sweeper runs. Should
-   *                        be at most `warmIdleTtl / 2` for the actual
-   *                        idle time before demotion to be close to
-   *                        `warmIdleTtl`.
+   * @param coldIdleTtl     If `Some`, how long an entry may remain
+   *                        idle (in any state — warm or cold) before
+   *                        the sweeper evicts it entirely: deletes its
+   *                        on-disk `.jar` and removes it from the
+   *                        cache. The next `get` for that GAV is a
+   *                        full cache miss and re-downloads from
+   *                        upstream. If `None` (default), on-disk
+   *                        files persist for the life of the cache and
+   *                        only process restart resets the disk side.
+   *                        For a meaningful semantic, this should be
+   *                        `>= warmIdleTtl`; otherwise an entry would
+   *                        be evicted on the same sweep pass it was
+   *                        demoted on.
+   * @param sweepInterval   How often the demotion/eviction sweeper
+   *                        runs. Should be at most `warmIdleTtl / 2`
+   *                        for the actual idle time before demotion to
+   *                        be close to `warmIdleTtl`.
    */
   def make(
     cacheDir: File,
     download: (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, NotFoundError, JarMeta],
     label: String = "javadoc",
     warmIdleTtl: Duration = 30.minutes,
+    coldIdleTtl: Option[Duration] = None,
     sweepInterval: Duration = 1.minute,
   ): ZIO[Scope, Nothing, JarCache] =
     defer:
@@ -501,7 +591,7 @@ object JarCache:
 
       val jars    = ConcurrentMap.empty[GroupArtifactVersion, CacheEntry].run
       val pending = ConcurrentMap.empty[GroupArtifactVersion, Promise[NotFoundError, JarHandle]].run
-      val cache   = new JarCache(cacheDir, jars, pending, download, label, warmIdleTtl)
+      val cache   = new JarCache(cacheDir, jars, pending, download, label, warmIdleTtl, coldIdleTtl)
 
       // Sweeper runs for the life of the cache scope; the close-all
       // finalizer below also covers the case where the sweeper hasn't
