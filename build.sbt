@@ -22,7 +22,7 @@ libraryDependencies ++= Seq(
 
   "nl.vroste" %% "rezilience" % "0.10.5",
 
-  "org.bouncycastle" % "bcpg-jdk18on" % "1.84",
+  "org.bouncycastle" % "bcpg-jdk18on" % "1.85",
 
   "org.scala-lang.modules" %% "scala-xml" % "2.4.0",
 
