@@ -113,7 +113,18 @@ final class JarCache private (
               ZIO.logInfo(s"Awaiting in-flight $label jar fetch: $gav").run
               inFlight.await.run
             case None =>
-              fetchAndOpen(gav)
+              // We won the single-flight slot. Re-check `jars` before
+              // downloading: a prior winner for this GAV may have
+              // completed between our `jars.get` (which saw None) and our
+              // `putIfAbsent`. That winner does `jars.put` *before* it
+              // removes its pending slot, so if we don't re-check here we
+              // can win a stale slot and redundantly re-download an entry
+              // that already exists (the CI-flaky "downloads twice" race).
+              val fresh =
+                jars.get(gav).run match
+                  case Some(entry) => ZIO.succeed(JarCache.JarHandle(entry))
+                  case None        => fetchAndOpen(gav)
+              fresh
                 .onExit: exit =>
                   pendingFetches.remove(gav) *> myPromise.done(exit)
                 .run
