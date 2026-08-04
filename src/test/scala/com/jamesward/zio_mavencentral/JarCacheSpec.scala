@@ -91,6 +91,27 @@ object JarCacheSpec extends ZIOSpecDefault:
         .orDie.run
         JarMeta(None, None)
 
+  /** Writes corrupt bytes for the first `corruptFor` calls (per GAV), then a
+   *  valid jar — to exercise the bounded corrupt-download retry in
+   *  [[JarCache.get]]. */
+  private def flakyDownloader(
+    corruptFor: Int,
+    callCount: Ref[Map[GroupArtifactVersion, Int]],
+  ): (GroupArtifactVersion, File) => ZIO[Client, NotFoundError, JarMeta] =
+    (gav, target) =>
+      defer:
+        val counts = callCount.updateAndGet(m => m.updated(gav, m.getOrElse(gav, 0) + 1)).run
+        val n      = counts.getOrElse(gav, 0)
+        ZIO.attemptBlockingIO:
+          target.getParentFile.mkdirs()
+          if n <= corruptFor then
+            val out = java.io.FileOutputStream(target)
+            try out.write(corruptBytes) finally out.close()
+          else
+            writeJar(target, sampleEntries)
+        .orDie.run
+        JarMeta(None, None)
+
   /** Provides a fresh JarCache (rooted in a unique tmp dir) plus the
    *  call-count Ref to the test body. The cache's scope cleans up
    *  ZipFile handles; we also recursively delete the tmp dir. */
@@ -562,7 +583,33 @@ object JarCacheSpec extends ZIOSpecDefault:
             !onDiskExists,
             sized == 0,
             !cached,
-            downloads == 2,
+            // Each get re-downloads (corruption isn't cached) and, since a
+            // corrupt download is retried a bounded number of times, makes
+            // `corruptRetries + 1` attempts. Two gets → 2 * (corruptRetries + 1).
+            downloads == 2 * (JarCache.corruptRetries + 1),
+          )
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("a transient corrupt download recovers within the retry budget") {
+      val body = ZIO.scoped:
+        defer:
+          val callCount = Ref.make(Map.empty[GroupArtifactVersion, Int]).run
+          val tmp = ZIO.attemptBlockingIO(Files.createTempDirectory("jar-cache-flaky-test").nn.toFile).orDie.run
+          ZIO.addFinalizer(ZIO.attempt(recursivelyDelete(tmp)).ignore).run
+          // Corrupt for exactly `corruptRetries` attempts, then valid — so the
+          // last retry (attempt corruptRetries + 1) succeeds and the entry is
+          // cached, proving the bounded retry recovers transient corruption.
+          val cache = JarCache.make(tmp, flakyDownloader(JarCache.corruptRetries, callCount)).run
+
+          val result    = cache.get(gavCorrupt).either.run
+          val downloads = callCount.get.map(_.getOrElse(gavCorrupt, 0)).run
+          val cached    = cache.contains(gavCorrupt).run
+
+          assertTrue(
+            result.isRight,
+            downloads == JarCache.corruptRetries + 1,
+            cached,
           )
       body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },

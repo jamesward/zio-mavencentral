@@ -123,7 +123,19 @@ final class JarCache private (
               val fresh =
                 jars.get(gav).run match
                   case Some(entry) => ZIO.succeed(JarCache.JarHandle(entry))
-                  case None        => fetchAndOpen(gav)
+                  case None        =>
+                    // Upstream corruption is usually a transient truncated /
+                    // mangled transfer that a re-download fixes (the corrupt
+                    // file is deleted before we fail, so each attempt re-fetches
+                    // cleanly). Retry a bounded number of times on
+                    // UpstreamCorruptError only — never on NotFound (a 404
+                    // won't become present by retrying).
+                    fetchAndOpen(gav).retry(
+                      Schedule.recurs(JarCache.corruptRetries).whileInput[NotFoundError | JarCache.UpstreamCorruptError] {
+                        case _: JarCache.UpstreamCorruptError => true
+                        case _: NotFoundError                 => false
+                      }
+                    )
               fresh
                 .onExit: exit =>
                   pendingFetches.remove(gav) *> myPromise.done(exit)
@@ -242,6 +254,13 @@ final class JarCache private (
       ZIO.foreachDiscard(kvs)((_, e) => e.shutdown)
 
 object JarCache:
+
+  /** How many times [[JarCache.get]] re-downloads a jar whose bytes fail to
+   *  parse as a valid zip before giving up with [[UpstreamCorruptError]].
+   *  Corruption is usually a transient truncated/mangled transfer, so a small
+   *  bounded retry recovers it without hammering upstream on a genuinely bad
+   *  publish. */
+  private[zio_mavencentral] val corruptRetries: Int = 2
 
   /** Failure type for entry lookups. Distinct from `NotFoundError`,
    *  which signals the *jar* was not found upstream. */
