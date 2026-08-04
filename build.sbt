@@ -43,16 +43,16 @@ javaOptions ++= Seq(
   "--sun-misc-unsafe-memory-access=allow",
 )
 
-licenses := Seq("MIT License" -> url("https://opensource.org/licenses/MIT"))
+licenses := Seq("MIT License" -> uri("https://opensource.org/licenses/MIT"))
 
-homepage := Some(url("https://github.com/jamesward/zio-mavencentral"))
+homepage := Some(uri("https://github.com/jamesward/zio-mavencentral"))
 
 developers := List(
   Developer(
     "jamesward",
     "James Ward",
     "james@jamesward.com",
-    url("https://jamesward.com")
+    uri("https://jamesward.com")
   )
 )
 

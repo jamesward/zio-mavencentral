@@ -9,6 +9,7 @@ import zio.direct.*
 import zio.http.*
 import zio.http.codec.PathCodec
 import zio.schema.{Schema, derived}
+import zio.schema.annotation.description
 import zio.stream.{ZPipeline, ZSink}
 import zio.{Chunk, ChunkBuilder, Duration, IO, Schedule, Scope, Trace, ZIO, ZLayer, durationInt}
 
@@ -54,19 +55,46 @@ object MavenCentral:
     val latest: Version = Version("latest")
 
   case class ArtifactAndVersion(artifactId: ArtifactId, maybeVersion: Option[Version] = None)
-  case class GroupArtifact(groupId: GroupId, artifactId: ArtifactId):
+  @description("A Maven Central artifact coordinate: a groupId and artifactId, without a version.")
+  case class GroupArtifact(
+    @description("The Maven groupId, e.g. \"dev.zio\".")
+    groupId: GroupId,
+    @description("The Maven artifactId, e.g. \"zio_3\".")
+    artifactId: ArtifactId,
+  ):
     lazy val toPath: Path = groupId / artifactId
 
     @targetName("slash")
     @unused
     def /(version: Version): Path = toPath / version
 
-  case class GroupArtifactVersion(groupId: GroupId, artifactId: ArtifactId, version: Version):
+  object GroupArtifact:
+    // The ambient, canonical schema is the record form (derived in
+    // `MavenCentralSchemas`, outside this object, so the opaque field types
+    // stay opaque and their `@description`s are readable). `schema` is also
+    // exposed as a plain `val` for consumers that shadow the given with their
+    // own (e.g. a string codec).
+    val schema: Schema[GroupArtifact] = MavenCentralSchemas.groupArtifact
+    given Schema[GroupArtifact] = schema
+
+  @description("A fully-qualified Maven Central artifact coordinate: groupId, artifactId, and version.")
+  case class GroupArtifactVersion(
+    @description("The Maven groupId, e.g. \"dev.zio\".")
+    groupId: GroupId,
+    @description("The Maven artifactId, e.g. \"zio_3\".")
+    artifactId: ArtifactId,
+    @description("The artifact version, e.g. \"2.1.9\".")
+    version: Version,
+  ):
     @unused
     lazy val noVersion: GroupArtifact = GroupArtifact(groupId, artifactId)
     @unused
     lazy val toPath: Path = groupId / artifactId / version
     override def toString: String = s"$groupId/$artifactId/$version"
+
+  object GroupArtifactVersion:
+    val schema: Schema[GroupArtifactVersion] = MavenCentralSchemas.groupArtifactVersion
+    given Schema[GroupArtifactVersion] = schema
 
   case class WithCacheInfo[A](value: A, maybeLastModified: Option[ZonedDateTime], maybeEtag: Option[Header.ETag])
 
@@ -111,18 +139,10 @@ object MavenCentral:
   def gav(groupId: String, artifactId: String, version: String): GroupArtifactVersion =
     GroupArtifactVersion(GroupId(groupId), ArtifactId(artifactId), Version(version))
 
-  given Schema[GroupId] = Schema.primitive[String].transform(MavenCentral.GroupId.apply, identity)
-  given Schema[ArtifactId] = Schema.primitive[String].transform(MavenCentral.ArtifactId.apply, identity)
-  given Schema[Version] = Schema.primitive[String].transform(MavenCentral.Version.apply, identity)
-
-  private def stringToGroupArtifact(s: String): MavenCentral.GroupArtifact =
-    // todo: parse failure handling
-    val parts = s.split(':')
-    MavenCentral.GroupArtifact(MavenCentral.GroupId(parts(0)), MavenCentral.ArtifactId(parts(1)))
-
-  private def groupArtifactToString(ga: MavenCentral.GroupArtifact): String = s"${ga.groupId}:${ga.artifactId}"
-
-  given Schema[MavenCentral.GroupArtifact] = Schema.primitive[String].transform(stringToGroupArtifact, groupArtifactToString)
+  // Schema givens live in `MavenCentralSchemas` (below, outside this object)
+  // where the opaque types are opaque, so they are genuinely typed; the
+  // GroupArtifact/GroupArtifactVersion record schemas are also surfaced as
+  // ambient givens via their companions above.
 
   given CanEqual[Path, Path] = CanEqual.derived
   given CanEqual[GroupId, GroupId] = CanEqual.derived
@@ -733,3 +753,27 @@ object MavenCentral:
             ZIO.attempt(sGen.generate().encode(bOut)).run
         .as(Some(builder.result()))
       .mapError(signError)
+
+/**
+ * Ambient `Schema` instances for the Maven Central coordinate types.
+ *
+ * Defined outside `object MavenCentral` so the opaque `GroupId` / `ArtifactId`
+ * / `Version` types are opaque here — the primitive transforms are genuinely
+ * `Schema[GroupId]` (not `Schema[String]`), and `GroupArtifact` /
+ * `GroupArtifactVersion` derive as *records* carrying their field
+ * `@description`s (deriving in the same compilation unit as the annotated case
+ * classes keeps the annotations readable). The record schemas are re-exported
+ * as ambient givens via the case classes' companions; the opaque-type givens
+ * here can be imported (`import MavenCentralSchemas.given`) by code that
+ * derives other records over these types.
+ */
+object MavenCentralSchemas:
+  import zio.schema.DeriveSchema
+  import MavenCentral.*
+
+  given Schema[GroupId]    = Schema.primitive[String].transform(GroupId(_), _.toString)
+  given Schema[ArtifactId] = Schema.primitive[String].transform(ArtifactId(_), _.toString)
+  given Schema[Version]    = Schema.primitive[String].transform(Version(_), _.toString)
+
+  val groupArtifact: Schema[GroupArtifact] = DeriveSchema.gen[GroupArtifact]
+  val groupArtifactVersion: Schema[GroupArtifactVersion] = DeriveSchema.gen[GroupArtifactVersion]
