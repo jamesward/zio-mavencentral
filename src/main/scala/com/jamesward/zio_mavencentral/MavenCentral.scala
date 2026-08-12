@@ -11,7 +11,7 @@ import zio.http.codec.PathCodec
 import zio.schema.{Schema, derived}
 import zio.schema.annotation.description
 import zio.stream.{ZPipeline, ZSink}
-import zio.{Chunk, ChunkBuilder, Duration, IO, Schedule, Scope, Trace, ZIO, ZLayer, durationInt}
+import zio.{Chunk, ChunkBuilder, Duration, IO, Schedule, Scope, Trace, ZIO, ZLayer, durationInt, duration2DurationOps}
 
 import java.io.{File, IOException}
 import java.nio.file.Files
@@ -249,17 +249,25 @@ object MavenCentral:
     /**
      * Build a layer with custom mirrors and tuning.
      *
-     * @param mirrors      Mirror base URLs in preference order.
-     * @param maxFailures  Successive fallback-worthy failures before the
-     *                     breaker for a single mirror trips.
-     * @param resetMin     Initial open-state duration before probing again.
-     * @param resetMax     Cap on the open-state duration.
+     * @param mirrors        Mirror base URLs in preference order.
+     * @param maxFailures    Successive fallback-worthy failures before the
+     *                       breaker for a single mirror trips.
+     * @param resetMin       Initial open-state duration before probing again.
+     * @param resetMax       Cap on the open-state duration.
+     * @param requestTimeout Per-mirror-attempt wall-clock timeout. A request
+     *                       that doesn't complete within this bound is failed
+     *                       with an `IOException` (rather than hanging the
+     *                       fiber forever on a stalled/throttled connection).
+     *                       Because a timeout is a `trippingError`, it both
+     *                       counts toward tripping the mirror's breaker and
+     *                       triggers fallback to the next mirror.
      */
     def custom(
-      mirrors: List[URL] = defaultMirrors,
-      maxFailures: Int   = 10,
-      resetMin: Duration = 1.hour,
-      resetMax: Duration = 24.hours,
+      mirrors: List[URL]       = defaultMirrors,
+      maxFailures: Int         = 10,
+      resetMin: Duration       = 1.hour,
+      resetMax: Duration       = 24.hours,
+      requestTimeout: Duration = 30.seconds,
     ): ZLayer[Client, Nothing, MavenCentralRepo] =
       ZLayer.scoped:
         defer:
@@ -271,9 +279,9 @@ object MavenCentral:
               isFailure   = trippingError,
             ).map(Mirror(url, _))
           .run
-          Live(client, builtMirrors)
+          Live(client, builtMirrors, requestTimeout)
 
-    private final class Live(client: Client, mirrors: List[Mirror]) extends MavenCentralRepo:
+    private final class Live(client: Client, mirrors: List[Mirror], requestTimeout: Duration) extends MavenCentralRepo:
       def request(
         path: Path,
         method: Method = Method.GET,
@@ -289,11 +297,17 @@ object MavenCentral:
             case Mirror(base, breaker) :: rest =>
               val req = Request(method = method, url = base.addPath(path), headers = headers, body = content)
               breaker(
-                client.batched(req).flatMap: resp =>
-                  if isFallbackWorthy(resp.status) then
-                    ZIO.fail(temporaryOrUnknown(resp))
-                  else
-                    ZIO.succeed(resp -> req.url)
+                client.batched(req)
+                  // Bound each mirror attempt so a stalled/throttled connection
+                  // can't hang the fiber indefinitely. A timeout surfaces as an
+                  // IOException — a `trippingError` — so it counts toward the
+                  // breaker and triggers fallback to the next mirror.
+                  .timeoutFail(IOException(s"Request to ${req.url} timed out after ${requestTimeout.render}"))(requestTimeout)
+                  .flatMap: resp =>
+                    if isFallbackWorthy(resp.status) then
+                      ZIO.fail(temporaryOrUnknown(resp))
+                    else
+                      ZIO.succeed(resp -> req.url)
               ).foldZIO(
                 {
                   case CircuitBreakerOpen =>
@@ -534,11 +548,21 @@ object MavenCentral:
    * fallback should obtain the URL via [[jarUri]] / [[javadocUri]] /
    * [[sourcesUri]] (which do go through the repo) and only then call
    * `downloadJar` on the resulting URL.
+   *
+   * `responseTimeout` bounds how long we wait for the response *headers*
+   * (i.e. `Client.streaming` to return) — the phase where a stalled or
+   * throttled upstream connection would otherwise hang the fiber forever.
+   * It deliberately does not bound the body transfer itself, so a large
+   * but steadily-progressing download isn't cut off; a timeout here fails
+   * with an `IOException`.
    */
-  def downloadJar(source: URL, target: File): ZIO[Client, Throwable, JarMeta] =
+  def downloadJar(source: URL, target: File, responseTimeout: Duration = 60.seconds): ZIO[Client, Throwable, JarMeta] =
     ZIO.scoped:
       defer:
-        val response = Client.streaming(Request.get(source)).run
+        val response =
+          Client.streaming(Request.get(source))
+            .timeoutFail(IOException(s"Request to $source timed out after ${responseTimeout.render}"))(responseTimeout)
+            .run
         response.status match
           case status if status.isError => ZIO.fail(temporaryOrUnknown(response)).run
           case _ => // success, continue
