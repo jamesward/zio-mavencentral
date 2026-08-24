@@ -92,7 +92,7 @@ final class JarCache private (
    *   - Cache miss: at most one fiber per GAV downloads + opens; concurrent
    *     callers for the same GAV await the same `Promise`.
    *   - Cache miss with corrupt upstream bytes: fails with
-   *     [[JarCache.UpstreamCorruptError]] (not [[NotFoundError]]).
+   *     [[JarCache.UpstreamCorruptError]] (not [[MavenCentral.NotFoundError]]).
    *     Maven Central is rare-but-not-impossibly known to host malformed
    *     jars from botched publishes (zero-byte payloads, truncated
    *     archives, etc.). Distinguishing this case lets callers map it
@@ -339,7 +339,7 @@ object JarCache:
       java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
-     * Acquire the entry's `ZipFile` under a [[Scope]]. Bumps `refCount`
+     * Acquire the entry's `ZipFile` under a [[zio.Scope]]. Bumps `refCount`
      * on entry, decrements on scope close. The `ZipFile` is guaranteed
      * not to be closed by the sweeper for the lifetime of the scope.
      *
@@ -615,7 +615,7 @@ object JarCache:
    * (or `sourcesUri`), then streams the jar bytes to `target` via
    * [[MavenCentral.downloadJar]].
    *
-   * URL resolution goes through [[MavenCentralRepo]], so transient
+   * URL resolution goes through [[MavenCentral.MavenCentralRepo]], so transient
    * upstream failures (5xx / 429 / 403) trigger mirror fallback and
    * count toward each mirror's circuit breaker. There is no per-call
    * retry — failure of the resolve step is surfaced directly.
@@ -642,7 +642,7 @@ object JarCache:
         MavenCentral.downloadJar(url, target).orDie.run
 
   /**
-   * Construct a `JarCache`. The returned ZIO requires a [[Scope]]; when
+   * Construct a `JarCache`. The returned ZIO requires a [[zio.Scope]]; when
    * the scope closes (typically at app shutdown):
    *
    *   1. The background sweeper fiber is interrupted.

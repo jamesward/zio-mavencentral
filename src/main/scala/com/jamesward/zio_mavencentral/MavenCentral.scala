@@ -193,7 +193,7 @@ object MavenCentral:
    *
    * Wiring
    * ------
-   * One [[CircuitBreaker]] per configured mirror. A request walks the
+   * One [[nl.vroste.rezilience.CircuitBreaker]] per configured mirror. A request walks the
    * mirror list in order. For each mirror:
    *
    *   - If its breaker is open, the call fails fast with `CircuitBreakerOpen`
