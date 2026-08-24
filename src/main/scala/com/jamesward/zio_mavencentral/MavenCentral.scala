@@ -11,7 +11,7 @@ import zio.http.codec.PathCodec
 import zio.schema.{Schema, derived}
 import zio.schema.annotation.description
 import zio.stream.{ZPipeline, ZSink}
-import zio.{Chunk, ChunkBuilder, Duration, IO, Schedule, Scope, Trace, ZIO, ZLayer, durationInt, duration2DurationOps}
+import zio.{Chunk, ChunkBuilder, Duration, IO, LogAnnotation, Schedule, Scope, Trace, ZIO, ZLayer, durationInt, duration2DurationOps}
 
 import java.io.{File, IOException}
 import java.nio.file.Files
@@ -311,9 +311,13 @@ object MavenCentral:
               ).foldZIO(
                 {
                   case CircuitBreakerOpen =>
-                    ZIO.logInfo(s"Circuit open for $base, skipping").flatMap(_ => attempt(rest, firstErr))
+                    ZIO.logAnnotate(LogAnnotation("mirror", base.toString))(ZIO.logInfo("Circuit open, skipping")).flatMap(_ => attempt(rest, firstErr))
                   case WrappedError(t)    =>
-                    ZIO.logWarning(s"Mirror $base failed: ${t.getClass.getSimpleName}: ${t.getMessage}")
+                    ZIO.logAnnotate(
+                      LogAnnotation("mirror", base.toString),
+                      LogAnnotation("errorClass", t.getClass.getSimpleName),
+                      LogAnnotation("error", Option(t.getMessage).getOrElse("-")),
+                    )(ZIO.logWarning("Mirror failed"))
                       .flatMap(_ => attempt(rest, firstErr.orElse(Some(t))))
                 },
                 ok => ZIO.succeed(ok)

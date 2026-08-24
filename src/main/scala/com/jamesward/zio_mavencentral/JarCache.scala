@@ -110,7 +110,10 @@ final class JarCache private (
           val maybeWaiting = pendingFetches.putIfAbsent(gav, myPromise).run
           maybeWaiting match
             case Some(inFlight) =>
-              ZIO.logInfo(s"Awaiting in-flight $label jar fetch: $gav").run
+              ZIO.logAnnotate(
+                LogAnnotation("label", label),
+                LogAnnotation("gav", gav.toString),
+              )(ZIO.logInfo("Awaiting in-flight jar fetch")).run
               inFlight.await.run
             case None =>
               // We won the single-flight slot. Re-check `jars` before
@@ -161,16 +164,29 @@ final class JarCache private (
   private def fetchAndOpen(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, NotFoundError | JarCache.UpstreamCorruptError, JarCache.JarHandle] =
     defer:
       val jarFile = File(cacheDir, JarCache.jarFileName(gav))
-      ZIO.logInfo(s"Downloading $label jar: $gav").run
+      ZIO.logAnnotate(
+        LogAnnotation("label", label),
+        LogAnnotation("gav", gav.toString),
+      )(ZIO.logInfo("Downloading jar")).run
       val (duration, meta) = download(gav, jarFile).timed.run
       val sizeBytes        = ZIO.attempt(jarFile.length()).orDie.run
-      ZIO.logInfo(s"Downloaded $label jar: $gav size=${sizeBytes / 1024}KB duration=${duration.toMillis}ms").run
+      ZIO.logAnnotate(
+        LogAnnotation("label", label),
+        LogAnnotation("gav", gav.toString),
+        LogAnnotation("sizeKb", (sizeBytes / 1024).toString),
+        LogAnnotation("durationMs", duration.toMillis.toString),
+      )(ZIO.logInfo("Downloaded jar")).run
 
       val zipFile =
         ZIO.attemptBlockingIO(ZipFile(jarFile)).foldZIO(
           {
             case e: java.util.zip.ZipException =>
-              ZIO.logWarning(s"Corrupt $label jar from upstream: $gav (size=${sizeBytes}B): ${e.getMessage}") *>
+              ZIO.logAnnotate(
+                LogAnnotation("label", label),
+                LogAnnotation("gav", gav.toString),
+                LogAnnotation("sizeBytes", sizeBytes.toString),
+                LogAnnotation("error", Option(e.getMessage).getOrElse("-")),
+              )(ZIO.logWarning("Corrupt jar from upstream")) *>
                 ZIO.attempt(jarFile.delete()).ignore *>
                 ZIO.fail(JarCache.UpstreamCorruptError(gav, sizeBytes, Option(e.getMessage).getOrElse("zip parse failed").nn))
             case e =>
@@ -418,7 +434,10 @@ object JarCache:
             .run
           taken match
             case Some(zip) =>
-              ZIO.logInfo(s"Demoting $label jar to cold: $gav").run
+              ZIO.logAnnotate(
+                LogAnnotation("label", label),
+                LogAnnotation("gav", gav.toString),
+              )(ZIO.logInfo("Demoting jar to cold")).run
               ZIO.attemptBlockingIO(zip.close()).ignoreLogged.run
               true
             case None =>
@@ -460,7 +479,10 @@ object JarCache:
               val s = state.get.run
               if s.refCount == 0 && s.zip.isEmpty && !closedFlag.get() then
                 closedFlag.set(true)
-                ZIO.logInfo(s"Evicting cold $label jar: $gav").run
+                ZIO.logAnnotate(
+                  LogAnnotation("label", label),
+                  LogAnnotation("gav", gav.toString),
+                )(ZIO.logInfo("Evicting cold jar")).run
                 ZIO.attempt(file.delete()).ignoreLogged.run
                 true
               else
