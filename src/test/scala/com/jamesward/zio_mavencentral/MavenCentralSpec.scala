@@ -4,6 +4,7 @@ import MavenCentral.{*, given}
 import zio.*
 import zio.direct.*
 import zio.http.{Client, Path, Response, Status, URL, ZClientAspect}
+import zio.stream.ZStream
 import zio.test.*
 
 import java.nio.file.Files
@@ -237,7 +238,10 @@ object MavenCentralSpec extends ZIOSpecDefault:
         val zip = getClass.getResourceAsStream(s"/$filename").nn.readAllBytes()
 
         defer:
-          val deploymentId = MavenCentral.Deploy.upload(filename, zip).debug.run
+          val deploymentId = MavenCentral.Deploy.upload(
+            filename,
+            ZStream.fromChunk(Chunk.fromArray(zip)),
+          ).debug.run
 
           val status = MavenCentral.Deploy.checkStatus(deploymentId)
             .filterOrFail(_.isFinal)(IllegalStateException("Waiting on final deployment status")) // todo: add current state to error

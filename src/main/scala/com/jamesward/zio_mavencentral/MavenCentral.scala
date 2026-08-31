@@ -10,10 +10,11 @@ import zio.http.*
 import zio.http.codec.PathCodec
 import zio.schema.{Schema, derived}
 import zio.schema.annotation.description
-import zio.stream.{ZPipeline, ZSink}
-import zio.{Chunk, ChunkBuilder, Duration, IO, LogAnnotation, Schedule, Scope, Trace, ZIO, ZLayer, durationInt, duration2DurationOps}
+import zio.stream.{ZPipeline, ZSink, ZStream}
+import zio.{Chunk, ChunkBuilder, Duration, IO, LogAnnotation, Ref, Schedule, Scope, Trace, ZIO, ZLayer, durationInt, duration2DurationOps}
 
 import java.io.{File, IOException}
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.time.ZonedDateTime
 import java.util.Base64
@@ -668,21 +669,38 @@ object MavenCentral:
       def isFinal: Boolean = this == FAILED || this == PUBLISHED || this == VALIDATED
 
 
+    type UploadStream = ZStream[Any, Throwable, Byte]
+
+    private[zio_mavencentral] def uploadBody(
+      filename: String,
+      zip: UploadStream,
+      boundary: Boundary,
+    ): Body =
+      val safeFilename = filename
+        .replace("\\", "%5C")
+        .replace("\"", "%22")
+        .replace("\r", "")
+        .replace("\n", "")
+      val prefix = Chunk.fromArray(
+        (s"--${boundary.id}\r\n" +
+          s"Content-Disposition: form-data; name=\"bundle\"; filename=\"$safeFilename\"\r\n" +
+          "Content-Type: application/octet-stream\r\n" +
+          "\r\n").getBytes(StandardCharsets.UTF_8),
+      )
+      val suffix = Chunk.fromArray(s"\r\n--${boundary.id}--\r\n".getBytes(StandardCharsets.UTF_8))
+      Body.fromStreamChunked(ZStream.fromChunk(prefix) ++ zip ++ ZStream.fromChunk(suffix))
+        .contentType(MediaType.multipart.`form-data`, boundary)
+
     def upload(filename: String, zip: Array[Byte]): ZIO[Sonatype, Throwable, DeploymentId] =
+      upload(filename, ZStream.fromChunk(Chunk.fromArray(zip)))
+
+    def upload(filename: String, zip: UploadStream): ZIO[Sonatype, Throwable, DeploymentId] =
       ZIO.serviceWithZIO[Sonatype]:
         sonatype =>
           ZIO.scoped:
             defer:
-              val body = Body.fromMultipartFormUUID(
-                Form(
-                  FormField.binaryField(
-                    "bundle",
-                    Chunk.fromArray(zip),
-                    MediaType.application.`octet-stream`,
-                    filename = Some(filename),
-                  )
-                )
-              ).run
+              val boundary = Boundary.randomUUID.run
+              val body = uploadBody(filename, zip, boundary)
               val response = sonatype.client.post("/api/v1/publisher/upload")(body).run
               response.body.asString.run
 
@@ -712,6 +730,9 @@ object MavenCentral:
             sonatype.client.delete(s"/api/v1/publisher/deployment/$deploymentId").unit
 
     def uploadVerifyAndPublish(filename: String, zip: Array[Byte]): ZIO[Sonatype, Throwable, Unit] =
+      uploadVerifyAndPublish(filename, ZStream.fromChunk(Chunk.fromArray(zip)))
+
+    def uploadVerifyAndPublish(filename: String, zip: UploadStream): ZIO[Sonatype, Throwable, Unit] =
       ZIO.serviceWithZIO[Sonatype]:
         sonatype =>
           ZIO.scoped:
@@ -732,7 +753,17 @@ object MavenCentral:
   trait Signer:
     def ascSign(toSign: Chunk[Byte]): IO[Throwable, Option[Chunk[Byte]]]
 
+    /** Fresh incremental signer for one payload. The default preserves source
+      * compatibility for custom Signer implementations that only support the
+      * original whole-chunk API. */
+    def newSession: IO[Throwable, Signer.Session] =
+      ZIO.fail(UnsupportedOperationException("incremental signing is not supported by this Signer"))
+
   object Signer:
+    trait Session:
+      def update(bytes: Chunk[Byte]): IO[Throwable, Unit]
+      def finish: IO[Throwable, Chunk[Byte]]
+
     def make(gpgKey: String, gpgPass: Option[String]): ZLayer[Any, Throwable, Signer] =
       // Parse the key material once; build a fresh, stateful PGPSignatureGenerator
       // per signing call so concurrent callers don't share its internal digest state.
@@ -762,25 +793,47 @@ object MavenCentral:
           builder += b(i)
           i += 1
 
-    override def ascSign(toSign: Chunk[Byte]): IO[Throwable, Option[Chunk[Byte]]] =
+    private def signatureGenerator: IO[Throwable, PGPSignatureGenerator] =
+      ZIO.attempt:
+        val signerBuilder = JcaPGPContentSignerBuilder(publicKey.getAlgorithm, HashAlgorithmTags.SHA256)
+        val generator = PGPSignatureGenerator(signerBuilder, publicKey)
+        generator.init(PGPSignature.BINARY_DOCUMENT, privKey)
+        generator
+
+    private def finishSignature(generator: PGPSignatureGenerator): IO[Throwable, Chunk[Byte]] =
       // The result chunk MUST be read after the streams are closed:
-      // ArmoredOutputStream writes the trailing CRC and end-of-armor
-      // marker on close(), and BCPGOutputStream may buffer partial
-      // packet data. Reading `builder.result()` before the scope
-      // releases produced a truncated, unverifiable signature.
+      // ArmoredOutputStream writes the trailing CRC and end-of-armor marker on
+      // close(), and BCPGOutputStream may buffer partial packet data.
       ZIO.attempt(ChunkBuilder.make[Byte]()).flatMap: builder =>
         ZIO.scoped:
           defer:
-            val signerBuilder = JcaPGPContentSignerBuilder(publicKey.getAlgorithm, HashAlgorithmTags.SHA256)
-            val sGen = PGPSignatureGenerator(signerBuilder, publicKey)
-            ZIO.attempt(sGen.init(PGPSignature.BINARY_DOCUMENT, privKey)).run
             val rawOut = ZIO.fromAutoCloseable(ZIO.attempt(ChunkBuilderOutputStream(builder))).run
             val armor = ZIO.fromAutoCloseable(ZIO.attempt(ArmoredOutputStream(rawOut))).run
             val bOut = ZIO.fromAutoCloseable(ZIO.attempt(BCPGOutputStream(armor))).run
-            ZIO.attempt(sGen.update(toSign.toArray)).run
-            ZIO.attempt(sGen.generate().encode(bOut)).run
-        .as(Some(builder.result()))
-      .mapError(signError)
+            ZIO.attempt(generator.generate().encode(bOut)).run
+        .as(builder.result())
+
+    override def newSession: IO[Throwable, Signer.Session] =
+      for
+        generator <- signatureGenerator
+        finished  <- Ref.make(false)
+      yield new Signer.Session:
+        def update(bytes: Chunk[Byte]): IO[Throwable, Unit] =
+          finished.get.flatMap: isFinished =>
+            ZIO.fail(IllegalStateException("signing session is already finished")).when(isFinished) *>
+              ZIO.attempt(bytes.foreach(generator.update))
+
+        def finish: IO[Throwable, Chunk[Byte]] =
+          finished.getAndSet(true).flatMap: wasFinished =>
+            ZIO.fail(IllegalStateException("signing session is already finished")).when(wasFinished) *>
+              finishSignature(generator)
+
+    override def ascSign(toSign: Chunk[Byte]): IO[Throwable, Option[Chunk[Byte]]] =
+      (for
+        session   <- newSession
+        _         <- session.update(toSign)
+        signature <- session.finish
+      yield Some(signature)).mapError(signError)
 
 /**
  * Ambient `Schema` instances for the Maven Central coordinate types.

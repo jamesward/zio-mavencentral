@@ -117,4 +117,20 @@ object SignerSpec extends ZIOSpecDefault:
         )
       .provide(Signer.make(gpgKey, None)),
 
+    test("incremental session signs multiple bounded chunks without materializing the payload"):
+      val gpgKey   = generateBase64KeyRing("stream@example.com", None)
+      val pubKey   = publicKeyOf(gpgKey)
+      val first    = Chunk.fromArray("hello ".getBytes("UTF-8").nn)
+      val second   = Chunk.fromArray("stream".getBytes("UTF-8").nn)
+      val expected = (first ++ second).toArray
+
+      ZIO.serviceWithZIO[Signer]: signer =>
+        for
+          session   <- signer.newSession
+          _         <- session.update(first)
+          _         <- session.update(second)
+          signature <- session.finish
+        yield assertTrue(verifySignature(signature.toArray, expected, pubKey))
+      .provide(Signer.make(gpgKey, None)),
+
   )
