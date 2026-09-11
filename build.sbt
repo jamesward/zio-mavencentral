@@ -24,7 +24,7 @@ libraryDependencies ++= Seq(
 
   "org.bouncycastle" % "bcpg-jdk18on" % "1.85",
 
-  "org.scala-lang.modules" %% "scala-xml" % "2.4.0",
+  "org.scala-lang.modules" %% "scala-xml" % "2.5.0",
 
   "de.sciss" %% "semverfi" % "0.3.0",
 
