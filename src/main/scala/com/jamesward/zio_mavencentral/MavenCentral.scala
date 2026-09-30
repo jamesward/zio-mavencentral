@@ -55,6 +55,29 @@ object MavenCentral:
     def unapply(s: String): Option[Version] = Some(s)
     val latest: Version = Version("latest")
 
+    /**
+     * Maven-compatible version ordering from coursier (`coursier.version.Version`,
+     * the same order as Maven's resolver): numeric segments compare numerically
+     * (`2.10 > 2.9`) and qualifiers rank `dev < alpha < beta < pre < milestone < rc
+     * < snapshot < release < ga < final < sp` (`2.0.0-RC2 < 2.0.0`). Plain string
+     * order is wrong for both.
+     */
+    given ordering: Ordering[Version] = Ordering.by[Version, coursier.version.Version](coursier.version.Version(_))
+
+    // Pre-release words coursier treats as plain literals rather than qualifiers.
+    private val extraPreReleaseTags = Set("preview", "ea", "eap", "nightly", "incubating")
+
+    /**
+     * True for dev / alpha / beta / milestone / release-candidate / snapshot builds
+     * (coursier's pre-release qualifiers, including `a1`/`b1`/`m1` abbreviations),
+     * plus preview / early-access / nightly / incubating builds. `33.7.2-jre`,
+     * `4.2.18.Final`, `5.0.0.RELEASE` and `2.7.0-SP1` are releases.
+     */
+    def isPreRelease(v: Version): Boolean =
+      coursier.version.Version(v).items.exists:
+        case tag: coursier.version.Version.Tag => tag.isPreRelease || extraPreReleaseTags.contains(tag.value)
+        case _                                 => false
+
   case class ArtifactAndVersion(artifactId: ArtifactId, maybeVersion: Option[Version] = None)
   @description("A Maven Central artifact coordinate: a groupId and artifactId, without a version.")
   case class GroupArtifact(
@@ -372,13 +395,18 @@ object MavenCentral:
     .flatten
 
 
-  // newest first
+  /**
+   * Every published version, newest first by Maven version order ([[Version.ordering]]).
+   * `maven-metadata.xml` lists versions in *publish* order, which is not version
+   * order: a maintenance release (e.g. 2.4.1.3 after 2.4.2) is appended last, so the
+   * file order must not be trusted.
+   */
   def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, WithCacheInfo[Seq[Version]]] =
     defer:
       val metadata = mavenMetadata(groupId, artifactId).run
       val versions = metadata.value \ "versioning" \ "versions" \ "version"
       WithCacheInfo(
-        versions.map(n => Version(n.text)).reverse,
+        newestFirst(versions.map(n => Version(n.text))),
         metadata.maybeLastModified,
         metadata.maybeEtag,
       )
@@ -399,14 +427,33 @@ object MavenCentral:
           case Status.NotFound => ZIO.fail(maybeArtifactId.fold(GroupIdNotFoundError(groupId))(GroupIdOrArtifactIdNotFoundError(groupId, _))).run
           case _ => ZIO.fail(temporaryOrUnknown(response)).run
 
-  // todo: potentially use maven-metadata.xml
-  def latest(groupId: GroupId, artifactId: ArtifactId): ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, Option[Version]] =
-    searchVersions(groupId, artifactId).map(_.value.headOption)
+  /** Distinct versions sorted newest first by [[Version.ordering]]. */
+  def newestFirst(versions: Seq[Version]): Seq[Version] =
+    versions.distinct.sorted(using Version.ordering.reverse)
+
+  /**
+   * The latest version from a list: the highest release, or — when
+   * [[includePreReleases]] is true, or the artifact has only pre-releases — the
+   * highest version of any kind.
+   */
+  def latestOf(versions: Seq[Version], includePreReleases: Boolean = false): Option[Version] =
+    val sorted = newestFirst(versions)
+    if includePreReleases then sorted.headOption
+    else sorted.find(v => !Version.isPreRelease(v)).orElse(sorted.headOption)
+
+  /**
+   * The latest version of an artifact. By default this is the highest *release*
+   * (so Spring AI resolves to 2.0.1, not 2.1.0-M1, and Netty to 4.2.x, not
+   * 5.0.0.Alpha2); pass `includePreReleases = true` for the highest version of any
+   * kind. An artifact that has only pre-releases resolves to its highest one.
+   */
+  def latest(groupId: GroupId, artifactId: ArtifactId, includePreReleases: Boolean = false): ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, Option[Version]] =
+    searchVersions(groupId, artifactId).map(v => latestOf(v.value, includePreReleases))
 
   /**
    * Resolve the latest published version for a `GroupArtifact`, with a
    * typed failure channel. Equivalent to:
-   *   `latest(g, a).someOrFail(LatestNotFound(ga))`
+   *   `latest(g, a, includePreReleases).someOrFail(LatestNotFound(ga))`
    * with throwables `orDie`'d. Convenient for callers that want a clean
    * `ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | LatestNotFound, Version]`.
    *
@@ -414,9 +461,9 @@ object MavenCentral:
    * handled by [[MavenCentralRepo]]'s mirror fallback + circuit breaker,
    * not by per-call retries.
    */
-  def latestOrFail(groupArtifact: GroupArtifact):
+  def latestOrFail(groupArtifact: GroupArtifact, includePreReleases: Boolean = false):
       ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | LatestNotFound, Version] =
-    latest(groupArtifact.groupId, groupArtifact.artifactId)
+    latest(groupArtifact.groupId, groupArtifact.artifactId, includePreReleases)
       .catchAll:
         case t: Throwable                        => ZIO.die(t)
         case e: GroupIdOrArtifactIdNotFoundError => ZIO.fail(e)

@@ -8,15 +8,23 @@ scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
   "-language:strictEquality",
   "-deprecation",
-  // "-Xfatal-warnings", // not sure where it went
+  "-Werror",
 )
+
+// sbt-mcp settings (loopback-only: its tools can execute build tasks)
+mcpEnabled := true
+mcpHost := "127.0.0.1"
+mcpPort := 5121
+
+// SkillsJars: extract agent Skills with `./sbt extractSkillsJars`
+skillsJarsOutputDir := Some(file(".kiro/skills"))
 
 val zioVersion = "2.1.26"
 
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                 % zioVersion,
   "dev.zio" %% "zio-concurrent"      % zioVersion,
-  "dev.zio" %% "zio-direct"          % "1.0.0-RC7",
+  "dev.zio" %% "zio-direct"          % "1.0.0-RC7", // no stable zio-direct release exists yet
   "dev.zio" %% "zio-http"            % "3.11.6",
   "dev.zio" %% "zio-schema-derivation" % "1.9.0",
 
@@ -26,22 +34,29 @@ libraryDependencies ++= Seq(
 
   "org.scala-lang.modules" %% "scala-xml" % "2.5.0",
 
-  "de.sciss" %% "semverfi" % "0.3.0",
+  // coursier's version ordering (Maven/Aether-compatible) and pre-release qualifiers
+  "io.get-coursier" %% "versions" % "0.6.1",
 
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
-  "dev.zio" %% "zio-test-magnolia"  % zioVersion % Test,
+
+  "com.jamesward" % "skills" % "0.0.4" % Skills,
 )
 
 fork := true
 
 javaOptions ++= Seq(
   "-Djava.net.preferIPv4Stack=true",
-  // JDK 25: suppress sun.misc.Unsafe / restricted-method warnings
-  // emitted by upstream libs (scala-library, netty-common).
   "--enable-native-access=ALL-UNNAMED",
-  "--sun-misc-unsafe-memory-access=allow",
 )
+
+// JDK 24+: suppress sun.misc.Unsafe warnings emitted by upstream libs
+// (scala-library, netty-common). The flag is unrecognized on Java 21 (the
+// default), so only add it when running on a newer JDK.
+javaOptions ++= {
+  if (sys.props("java.specification.version").toInt >= 24) Seq("--sun-misc-unsafe-memory-access=allow")
+  else Seq.empty
+}
 
 licenses := Seq("MIT License" -> uri("https://opensource.org/licenses/MIT"))
 
@@ -56,4 +71,4 @@ developers := List(
   )
 )
 
-ThisBuild / versionScheme := Some("semver-spec")
+versionScheme := Some("semver-spec")

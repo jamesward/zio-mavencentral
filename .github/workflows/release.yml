@@ -13,11 +13,11 @@ jobs:
       - uses: actions/setup-java@v6.0.1
         with:
           distribution: 'temurin'
-          java-version: 25
+          java-version: 21
           cache: 'sbt'
 
       - run: |
-          ./sbt test
+          ./sbt testFull
           ./sbt ci-release
         env:
           SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
