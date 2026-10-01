@@ -1,31 +1,31 @@
-# Daily Routine — zio-mavencentral
-
-Keep this library current and aligned with `AGENTS.md` and the `zen-of-projects` Skill, in a
-single rolling PR.
+# Daily Routine
 
 If there are other open PRs for this work, update that PR instead of creating a new one.
 
-1. Find the existing open PR for this routine first (title prefix `Daily maintenance:`):
-   `gh pr list --state open --search 'in:title "Daily maintenance:"'`. If one exists, check out
-   its branch and work there; only create a new branch/PR when none exists.
-2. Preserve existing work: build on the PR branch and any uncommitted changes; never discard,
-   revert, or force-push over someone else's commits.
-3. Update dependencies: resolve the latest **stable** versions (no RC/M/alpha/beta/SNAPSHOT) of
-   sbt (`project/build.properties`), Scala, every plugin in `project/plugins.sbt`, and every
-   library in `build.sbt` (including the `com.jamesward:skills` `% Skills` dependency), and pin
-   them exactly. Keep `zio-direct` on its latest release until a stable one exists. Review and
-   fold in open Dependabot PRs where they apply.
-4. Run `./sbt extractSkillsJars` and read the extracted `.kiro/skills/**/SKILL.md` files.
-5. Align the project with `AGENTS.md` and the `zen-of-projects` Skill (flat `build.sbt`, sbt-mcp
-   on port 5121 loopback-only, compiler flags, Java 21 in CI, launchers, `.gitignore`), and update
-   `AGENTS.md` when the code or workflow has drifted from it.
-6. Run CI locally with Java 21 and fix any failures:
+0. Load the project's MCP tools before anything else. `AGENTS.md` names the sbt-mcp server
+   (`sbt-mcp-<project>`). In Claude Code its tools are deferred, so load them with ToolSearch
+   (search for the server name). They include `sbt-task` for sbt commands and the javadocs.dev
+   tools such as `get_latest_version`. Use them for the rest of the run, and fall back to `./sbt`
+   and `curl` only when they are unavailable. Say which one you used.
+1. Update the Skills dependency. It is pinned in `build.sbt` as
+   `"com.jamesward" % "skills" % "<version>" % Skills`. List every pin (some projects also pin it
+   in an `example/` build) with:
+
    ```bash
-   ./sbt shutdown
-   ./sbt extractSkillsJars
-   ./sbt "Test / compile; testFull"
-   ./sbt shutdown
+   grep -rn '"com.jamesward" % "skills"' --include='*.sbt' . | grep -v -e /target/ -e /src/sbt-test/
    ```
-   Do not set `OSS_DEPLOY_USERNAME` / `OSS_DEPLOY_PASSWORD` (that test publishes to Sonatype).
-7. Commit to the single PR branch and push; update the PR description so it summarizes the
-   cumulative changes. If nothing changed, take no action.
+
+   Get the latest release with `get_latest_version` (group `com.jamesward`, artifact `skills`). Without
+   MCP, ask Maven Central itself, not a mirror (mirrors lag new releases):
+
+   ```bash
+   curl -fsS --retry 5 --retry-delay 10 --retry-all-errors https://repo.maven.apache.org/maven2/com/jamesward/skills/maven-metadata.xml | sed -n 's:.*<release>\(.*\)</release>.*:\1:p'
+   ```
+
+   Maven Central can rate-limit cloud sessions (HTTP 429); the retries cover that. Set every pin
+   to the version it prints.
+2. Run `reload; extractSkillsJars` with the sbt-mcp `sbt-task` tool, or `./sbt extractSkillsJars`. `.kiro/skills/` is gitignored, so it does not exist until this
+   runs. If sbt cannot download artifacts (for example HTTP 429 or a proxy 403), stop and report the
+   error instead of changing resolvers.
+3. Read `.kiro/skills/*zen-of-projects*/SKILL.md` and follow its "Daily Routine" section, using
+   `AGENTS.md` for this project's commands and documented exceptions.

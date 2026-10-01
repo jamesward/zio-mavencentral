@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sbt-mcp-zio-mavencentral": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [".claude/sbt-mcp-stdio.sh"]
+    }
+  }
+}
