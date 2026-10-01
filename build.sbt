@@ -40,7 +40,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
 
-  "com.jamesward" % "skills" % "0.0.4" % Skills,
+  "com.jamesward" % "skills" % "0.0.6" % Skills,
 )
 
 fork := true
