@@ -2,7 +2,7 @@ organization := "com.jamesward"
 
 name := "zio-mavencentral"
 
-scalaVersion := "3.9.0"
+scalaVersion := "3.10.0"
 
 scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
@@ -40,7 +40,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
 
-  "com.jamesward" % "skills" % "0.0.8" % Skills,
+  "com.jamesward" % "skills" % "0.0.11" % Skills,
 )
 
 fork := true
