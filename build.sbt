@@ -11,12 +11,7 @@ scalacOptions ++= Seq(
   "-Werror",
 )
 
-// sbt-mcp settings (loopback-only: its tools can execute build tasks)
-mcpEnabled := true
-mcpHost := "127.0.0.1"
-mcpPort := 5121
-
-// SkillsJars: extract agent Skills with `./sbt extractSkillsJars`
+// SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
 val zioVersion = "2.1.26"

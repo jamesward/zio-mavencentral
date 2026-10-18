@@ -6,7 +6,7 @@ working with Maven Central: the typed read API (`MavenCentral`), jar/zip downloa
 publishing client (`MavenCentral.Deploy.Sonatype`). See `README.md` for the feature overview.
 It is a library: releases go through sbt-ci-release with `versionScheme := Some("semver-spec")`.
 
-Follow the `zen-of-projects` Skill (extract with `./sbt extractSkillsJars`); this file records only
+Follow the `zen-of-projects` Skill (extract with `./sbta extractSkillsJars`); this file records only
 project-specific facts and exceptions.
 
 ## Skills
@@ -21,20 +21,20 @@ project-specific facts and exceptions.
 
 ## Build, Test & Dev Workflow
 
-- Use the MCP server named `sbt-mcp-zio-mavencentral` (`http://127.0.0.1:5121/`) for sbt interactions: `sbt-task` (separate commands with `;`),
+- Use the MCP server named `sbta` (`http://127.0.0.1:5121/`) for sbt interactions: `sbt-task` (separate commands with `;`),
   `list-tasks`, `check` (`"scope":"module"` after API changes), and `glob-search` / `inspect` /
   `symbol-location` plus the proxied javadocs.dev tools for symbol lookups. If it is unavailable,
-  say so and fall back to the `./sbt` launcher.
+  say so and fall back to the `./sbta` launcher.
   - Kiro: HTTP entry in `.kiro/settings/mcp.json`; start sbt first.
   - Claude Code: `.mcp.json` runs `.claude/sbt-mcp-stdio.sh` (approved in `.claude/settings.json`),
     a stdio bridge that starts a foreground sbt in cloud sessions (`CLAUDE_CODE_REMOTE=true`) and
     connects to an already-running sbt locally. Its tools are deferred: load them with ToolSearch
-    (search `sbt-mcp-zio-mavencentral`). Diagnostics: `/tmp/sbt-mcp-stdio.log`,
+    (search `sbta`). Diagnostics: `/tmp/sbt-mcp-stdio.log`,
     `/tmp/sbt-mcp-server.log`.
 - Commands (CLI fallback form):
-  - `./sbt "Test / compile"` — compile main + tests.
-  - `./sbt testFull` — full test suite (what CI runs).
-  - `./sbt "testOnly *MavenCentralSpec -- -t downloadAndExtractZip"` — a single test.
+  - `./sbta "Test / compile"` — compile main + tests.
+  - `./sbta testFull` — full test suite (what CI runs).
+  - `./sbta "testOnly *MavenCentralSpec -- -t downloadAndExtractZip"` — a single test.
 - `--sun-misc-unsafe-memory-access=allow` is added to forked test JVMs only when running on JDK 24+.
 - Most tests hit the real (free) Maven Central over the network. The Sonatype `upload and verify`
   test publishes for real and only runs when `OSS_DEPLOY_USERNAME` and `OSS_DEPLOY_PASSWORD` are
