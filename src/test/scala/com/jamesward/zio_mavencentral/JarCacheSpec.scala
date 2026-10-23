@@ -285,6 +285,70 @@ object JarCacheSpec extends ZIOSpecDefault:
       body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
+    test("an unreachable upstream fails with UpstreamUnavailableError, is not cached, and leaves no partial file") {
+      val body = ZIO.scoped:
+        defer:
+          val calls = Ref.make(0).run
+          val tmp   = ZIO.attemptBlockingIO(Files.createTempDirectory("jar-cache-test").nn.toFile).orDie.run
+          ZIO.addFinalizer(ZIO.attempt(recursivelyDelete(tmp)).ignore).run
+          // Writes half a jar, then fails the way a dropped connection does.
+          val failing: (GroupArtifactVersion, File) => ZIO[Client, JarCache.DownloadError, JarMeta] =
+            (g, target) =>
+              calls.update(_ + 1) *>
+                ZIO.attemptBlockingIO(Files.write(target.toPath, corruptBytes)).orDie *>
+                ZIO.fail(JarCache.UpstreamUnavailableError(g, "IOException (connection reset)"))
+          val cache = JarCache.make(tmp, failing).run
+          val r1 = cache.get(gavA).either.run
+          val r2 = cache.get(gavA).either.run
+          val n  = calls.get.run
+          val leftover = ZIO.attemptBlockingIO(tmp.listFiles.nn.toList.filter(_.getName.endsWith(".jar"))).orDie.run
+          assertTrue(
+            r1.left.toOption.contains(JarCache.UpstreamUnavailableError(gavA, "IOException (connection reset)")),
+            r2.isLeft,
+            // Not cached and not retried as if corrupt: each get calls the downloader once.
+            n == 2,
+            leftover.isEmpty,
+          )
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("httpDownloader types network failures as UpstreamUnavailableError with a readable reason") {
+      // Netty's connect exceptions read "null: host/ip:port" when the JDK cause has no message.
+      final class AnnotatedNoRouteToHostException(msg: String) extends java.net.NoRouteToHostException(msg)
+      val noRoute: Throwable = AnnotatedNoRouteToHostException("null: repo1.maven.org/104.18.18.12:443")
+      val download = JarCache.httpDownloader(_ => ZIO.fail(noRoute))
+      val body = ZIO.scoped:
+        defer:
+          val tmp = ZIO.attemptBlockingIO(Files.createTempFile("jar-cache-test", ".jar").nn.toFile).orDie.run
+          ZIO.addFinalizer(ZIO.attempt(tmp.delete()).ignore).run
+          val r = download(gavA, tmp).either.run
+          assertTrue(
+            r.left.toOption.contains(JarCache.UpstreamUnavailableError(gavA, "NoRouteToHostException (repo1.maven.org/104.18.18.12:443)")),
+          )
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("httpDownloader still dies on a non-network failure") {
+      val download = JarCache.httpDownloader(_ => ZIO.fail(IllegalStateException("bug")))
+      val body = ZIO.scoped:
+        defer:
+          val tmp = ZIO.attemptBlockingIO(Files.createTempFile("jar-cache-test", ".jar").nn.toFile).orDie.run
+          ZIO.addFinalizer(ZIO.attempt(tmp.delete()).ignore).run
+          val exit = download(gavA, tmp).exit.run
+          assertTrue(exit.causeOption.exists(_.isDie))
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("describeUpstreamFailure names the failure") {
+      assertTrue(
+        JarCache.describeUpstreamFailure(java.net.UnknownHostException("repo.maven.apache.org")) ==
+          "UnknownHostException (repo.maven.apache.org)",
+        JarCache.describeUpstreamFailure(java.net.SocketException()) == "SocketException",
+        JarCache.describeUpstreamFailure(java.io.IOException("Request to https://x timed out after 30 seconds")) ==
+          "IOException (Request to https://x timed out after 30 seconds)",
+      )
+    },
+
     test("size and totalBytes reflect cached entries") {
       val body = ZIO.scoped:
         withCache: (cache, _) =>

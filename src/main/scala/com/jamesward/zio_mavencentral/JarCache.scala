@@ -77,8 +77,8 @@ import java.util.zip.ZipFile
 final class JarCache private (
   cacheDir: File,
   jars: ConcurrentMap[GroupArtifactVersion, JarCache.CacheEntry],
-  pendingFetches: ConcurrentMap[GroupArtifactVersion, Promise[NotFoundError | JarCache.UpstreamCorruptError, JarCache.JarHandle]],
-  download: (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, NotFoundError, JarMeta],
+  pendingFetches: ConcurrentMap[GroupArtifactVersion, Promise[JarCache.GetError, JarCache.JarHandle]],
+  download: (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, JarCache.DownloadError, JarMeta],
   label: String,
   warmIdleTtl: Duration,
   coldIdleTtl: Option[Duration],
@@ -99,14 +99,18 @@ final class JarCache private (
    *     to a 422-style HTTP response rather than a 404 (the artifact
    *     does exist, it's just unprocessable) or — worse — letting it
    *     escape as an unhandled defect → 500.
+   *   - Cache miss when upstream can't be reached (network error, timeout,
+   *     or 5xx / 429 / 403 from every mirror): fails with
+   *     [[JarCache.UpstreamUnavailableError]]. Not cached and not retried
+   *     here; a later `get` tries again.
    */
-  def get(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, NotFoundError | JarCache.UpstreamCorruptError, JarCache.JarHandle] =
+  def get(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, JarCache.GetError, JarCache.JarHandle] =
     defer:
       jars.get(gav).run match
         case Some(entry) =>
           JarCache.JarHandle(entry)
         case None =>
-          val myPromise    = Promise.make[NotFoundError | JarCache.UpstreamCorruptError, JarCache.JarHandle].run
+          val myPromise    = Promise.make[JarCache.GetError, JarCache.JarHandle].run
           val maybeWaiting = pendingFetches.putIfAbsent(gav, myPromise).run
           maybeWaiting match
             case Some(inFlight) =>
@@ -134,9 +138,10 @@ final class JarCache private (
                     // UpstreamCorruptError only — never on NotFound (a 404
                     // won't become present by retrying).
                     fetchAndOpen(gav).retry(
-                      Schedule.recurs(JarCache.corruptRetries).whileInput[NotFoundError | JarCache.UpstreamCorruptError] {
-                        case _: JarCache.UpstreamCorruptError => true
-                        case _: NotFoundError                 => false
+                      Schedule.recurs(JarCache.corruptRetries).whileInput[JarCache.GetError] {
+                        case _: JarCache.UpstreamCorruptError     => true
+                        case _: NotFoundError                     => false
+                        case _: JarCache.UpstreamUnavailableError => false
                       }
                     )
               fresh
@@ -161,14 +166,19 @@ final class JarCache private (
    * [[JarCache.UpstreamCorruptError]] so the route handler can
    * distinguish "cannot be parsed" from "doesn't exist."
    */
-  private def fetchAndOpen(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, NotFoundError | JarCache.UpstreamCorruptError, JarCache.JarHandle] =
+  private def fetchAndOpen(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, JarCache.GetError, JarCache.JarHandle] =
     defer:
       val jarFile = File(cacheDir, JarCache.jarFileName(gav))
       ZIO.logAnnotate(
         LogAnnotation("label", label),
         LogAnnotation("gav", gav.toString),
       )(ZIO.logInfo("Downloading jar")).run
-      val (duration, meta) = download(gav, jarFile).timed.run
+      // A failed transfer can leave a partial file behind; remove it so a
+      // later attempt starts clean.
+      val (duration, meta) = download(gav, jarFile)
+        .tapError(_ => ZIO.attemptBlockingIO(jarFile.delete()).ignore)
+        .timed
+        .run
       val sizeBytes        = ZIO.attempt(jarFile.length()).orDie.run
       ZIO.logAnnotate(
         LogAnnotation("label", label),
@@ -297,6 +307,50 @@ object JarCache:
    *                    "zip END header not found")
    */
   case class UpstreamCorruptError(gav: GroupArtifactVersion, sizeBytes: Long, reason: String)
+
+  /**
+   * Failure type for [[JarCache.get]] when upstream could not be reached or
+   * answered with a transient failure: a network error (no route, DNS, refused
+   * or dropped connection, timeout) or a 5xx / 429 / 403 from every mirror.
+   * Distinct from `NotFoundError` (the artifact may well exist) and from
+   * [[UpstreamCorruptError]] (nothing usable was downloaded). It is not
+   * cached: a later `get` tries again. Callers typically map it to a 503.
+   *
+   * @param gav    the artifact whose jar could not be fetched
+   * @param reason a readable description of the underlying failure, e.g.
+   *               "NoRouteToHostException (repo1.maven.org/104.18.18.12:443)"
+   */
+  case class UpstreamUnavailableError(gav: GroupArtifactVersion, reason: String)
+
+  /** Failures a downloader passed to [[JarCache.make]] may report. */
+  type DownloadError = NotFoundError | UpstreamUnavailableError
+
+  /** Failures of [[JarCache.get]]. */
+  type GetError = NotFoundError | UpstreamCorruptError | UpstreamUnavailableError
+
+  /**
+   * Whether `t` is a transient upstream failure rather than a bug: any
+   * `IOException` (which covers connect/DNS/no-route failures, dropped
+   * connections and the request timeouts `MavenCentral` raises) or a
+   * [[MavenCentral.TemporaryServerError]].
+   */
+  private[zio_mavencentral] def isUpstreamFailure(t: Throwable): Boolean = t match
+    case _: java.io.IOException               => true
+    case _: MavenCentral.TemporaryServerError => true
+    case _                                    => false
+
+  /**
+   * A readable description of an upstream failure. Netty's connect exceptions
+   * read e.g. `null: repo1.maven.org/104.18.18.12:443` when the JDK cause has
+   * no message, so the exception type is named and a `null` message dropped.
+   */
+  private[zio_mavencentral] def describeUpstreamFailure(t: Throwable): String = t match
+    case e: MavenCentral.TemporaryServerError =>
+      s"HTTP ${e.response.status.code} from upstream"
+    case _ =>
+      val kind   = t.getClass.getSimpleName.nn.stripPrefix("Annotated")
+      val detail = Option(t.getMessage).map(_.stripPrefix("null: ").stripPrefix("null").trim).filter(_.nonEmpty)
+      detail.fold(kind)(d => s"$kind ($d)")
 
   /**
    * Internal hot-path state for a [[CacheEntry]]. Held in a single `Ref`
@@ -618,7 +672,9 @@ object JarCache:
    * URL resolution goes through [[MavenCentral.MavenCentralRepo]], so transient
    * upstream failures (5xx / 429 / 403) trigger mirror fallback and
    * count toward each mirror's circuit breaker. There is no per-call
-   * retry — failure of the resolve step is surfaced directly.
+   * retry. Network failures and transient HTTP errors from either step
+   * fail with [[JarCache.UpstreamUnavailableError]]; any other failure is
+   * a defect.
    *
    * The download step (`MavenCentral.downloadJar`) hits the resolved URL
    * directly via [[zio.http.Client]], so the returned function still
@@ -629,17 +685,24 @@ object JarCache:
    */
   def httpDownloader(
     uri: GroupArtifactVersion => ZIO[MavenCentralRepo, NotFoundError | MavenCentral.TemporaryServerError | Throwable, URL],
-  ): (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, NotFoundError, JarMeta] =
+  ): (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, JarCache.DownloadError, JarMeta] =
     (gav, target) =>
-      val resolveUrl: ZIO[MavenCentralRepo, NotFoundError, URL] =
+      // Network failures and transient HTTP errors are typed (callers can say
+      // "upstream unavailable, retry" instead of surfacing a defect); anything
+      // else is still a bug and dies.
+      def upstream(t: Throwable): IO[UpstreamUnavailableError, Nothing] =
+        if isUpstreamFailure(t) then ZIO.fail(UpstreamUnavailableError(gav, describeUpstreamFailure(t)))
+        else ZIO.die(t)
+
+      val resolveUrl: ZIO[MavenCentralRepo, DownloadError, URL] =
         uri(gav)
           .catchAll:
-            case t: Throwable      => ZIO.die(t)
             case nf: NotFoundError => ZIO.fail(nf)
+            case t: Throwable      => upstream(t)
 
       defer:
         val url = resolveUrl.run
-        MavenCentral.downloadJar(url, target).orDie.run
+        MavenCentral.downloadJar(url, target).catchAll(upstream).run
 
   /**
    * Construct a `JarCache`. The returned ZIO requires a [[zio.Scope]]; when
@@ -675,7 +738,7 @@ object JarCache:
    */
   def make(
     cacheDir: File,
-    download: (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, NotFoundError, JarMeta],
+    download: (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, JarCache.DownloadError, JarMeta],
     label: String = "javadoc",
     warmIdleTtl: Duration = 30.minutes,
     coldIdleTtl: Option[Duration] = None,
@@ -688,7 +751,7 @@ object JarCache:
       .orDie.run
 
       val jars    = ConcurrentMap.empty[GroupArtifactVersion, CacheEntry].run
-      val pending = ConcurrentMap.empty[GroupArtifactVersion, Promise[NotFoundError | UpstreamCorruptError, JarHandle]].run
+      val pending = ConcurrentMap.empty[GroupArtifactVersion, Promise[GetError, JarHandle]].run
       val cache   = new JarCache(cacheDir, jars, pending, download, label, warmIdleTtl, coldIdleTtl)
 
       // Sweeper runs for the life of the cache scope; the close-all
