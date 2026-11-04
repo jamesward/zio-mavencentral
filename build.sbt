@@ -23,7 +23,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-http"            % "3.11.6",
   "dev.zio" %% "zio-schema-derivation" % "1.9.0",
 
-  "nl.vroste" %% "rezilience" % "0.10.5",
+  "nl.vroste" %% "rezilience" % "0.10.6",
 
   "org.bouncycastle" % "bcpg-jdk18on" % "1.86",
 
@@ -35,7 +35,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
 
-  "com.jamesward" % "skills" % "0.0.21" % Skills,
+  "com.jamesward" % "skills" % "0.0.22" % Skills,
 )
 
 fork := true
