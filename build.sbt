@@ -2,7 +2,7 @@ organization := "com.jamesward"
 
 name := "zio-mavencentral"
 
-scalaVersion := "3.10.0"
+scalaVersion := "3.9.0"
 
 scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
@@ -21,21 +21,21 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-concurrent"      % zioVersion,
   "dev.zio" %% "zio-direct"          % "1.0.0-RC7", // no stable zio-direct release exists yet
   "dev.zio" %% "zio-http"            % "3.11.6",
-  "dev.zio" %% "zio-schema-derivation" % "1.9.0",
+  "dev.zio" %% "zio-schema-derivation" % "1.9.1",
 
   "nl.vroste" %% "rezilience" % "0.10.6",
 
-  "org.bouncycastle" % "bcpg-jdk18on" % "1.86",
+  "org.bouncycastle" % "bcpg-jdk18on" % "1.87",
 
   "org.scala-lang.modules" %% "scala-xml" % "2.5.0",
 
   // coursier's version ordering (Maven/Aether-compatible) and pre-release qualifiers
-  "io.get-coursier" %% "versions" % "0.6.1",
+  "io.get-coursier" %% "versions" % "0.7.0",
 
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
 
-  "com.jamesward" % "skills" % "0.0.22" % Skills,
+  "com.jamesward" % "skills" % "0.0.24" % Skills,
 )
 
 fork := true
