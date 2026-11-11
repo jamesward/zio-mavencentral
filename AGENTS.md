@@ -34,6 +34,7 @@ project-specific facts and exceptions.
 - Commands (CLI fallback form):
   - `./sbta "Test / compile"` — compile main + tests.
   - `./sbta testFull` — full test suite (what CI runs).
+  - `./sbta "Test / compile; testFull"` — full validation (maintenance routine).
   - `./sbta "testOnly *MavenCentralSpec -- -t downloadAndExtractZip"` — a single test.
 - `--sun-misc-unsafe-memory-access=allow` is added to forked test JVMs only when running on JDK 24+.
 - Most tests hit the real (free) Maven Central over the network. The Sonatype `upload and verify`
