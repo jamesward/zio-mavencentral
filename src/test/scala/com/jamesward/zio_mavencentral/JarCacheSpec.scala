@@ -57,6 +57,8 @@ object JarCacheSpec extends ZIOSpecDefault:
   private val gavMissing = gav("g", "missing", "1")
   private val gavCorrupt = gav("g", "corrupt", "1")
 
+  private lazy val sampleSizes: Map[String, Long] = sampleEntries.map((name, bytes) => name -> bytes.length.toLong)
+
   private val sampleEntries: Map[String, Array[Byte]] = Map(
     "index.html"        -> "<html>index</html>".getBytes(StandardCharsets.UTF_8),
     "pkg/Foo.html"      -> "<html>Foo</html>".getBytes(StandardCharsets.UTF_8),
@@ -169,16 +171,19 @@ object JarCacheSpec extends ZIOSpecDefault:
       body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
-    test("entryNames lists all entries; filterEntryNames matches predicate") {
+    test("entryNames lists all entries; filterEntryNames and filterEntrySizes match predicate") {
       val body = ZIO.scoped:
         withCache: (cache, _) =>
           defer:
             val handle = cache.get(gavA).run
             val all    = handle.entryNames.run
             val htmls  = handle.filterEntryNames(_.endsWith(".html")).run
+            val sizes  = handle.filterEntrySizes(_.endsWith(".html")).run
             assertTrue(
               all == sampleEntries.keySet,
               htmls == Set("index.html", "pkg/Foo.html", "pkg/Bar.html", "pkg/sub/Baz.html"),
+              sizes.keySet == htmls,
+              sizes.forall((name, size) => size.contains(sampleSizes(name))),
             )
       body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },

@@ -657,6 +657,24 @@ object JarCache:
             b.result()
           .orDie
 
+    /**
+     * Uncompressed size in bytes of each entry matching `predicate`, read from
+     * the zip's central directory (no data is decompressed). `None` when the
+     * jar doesn't record an entry's size. Single pass.
+     */
+    def filterEntrySizes(predicate: String => Boolean): UIO[Map[String, Option[Long]]] =
+      ZIO.scoped:
+        entry.acquire.flatMap: zip =>
+          ZIO.attemptBlockingIO:
+            val it = zip.entries.nn
+            val b  = Map.newBuilder[String, Option[Long]]
+            while it.hasMoreElements do
+              val e    = it.nextElement().nn
+              val name = e.getName.nn
+              if predicate(name) then b += name -> Option.when(e.getSize >= 0)(e.getSize)
+            b.result()
+          .orDie
+
   /**
    * Map a GAV to a flat filename. Slashes in `gav.toString` would collide
    * with directory paths; replace them so all jars live under one dir.
