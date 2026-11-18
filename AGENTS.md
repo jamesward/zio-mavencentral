@@ -6,14 +6,15 @@ working with Maven Central: the typed read API (`MavenCentral`), jar/zip downloa
 publishing client (`MavenCentral.Deploy.Sonatype`). See `README.md` for the feature overview.
 It is a library: releases go through sbt-ci-release with `versionScheme := Some("semver-spec")`.
 
-Follow the `zen-of-projects` Skill (extract with `./sbta extractSkillsJars`); this file records only
-project-specific facts and exceptions.
+Follow the `zen-of-projects` Skill; this file records only project-specific facts and exceptions.
 
 ## Skills
 
-- `zen-of-scala` — Scala 3 / ZIO idioms for all code and review.
-- `zen-of-james` — design, domain modeling, effects, and testing principles.
-- `zen-of-projects` — project/build conventions.
+Extract the Skills with `./sbta extractSkillsJars` (into `.kiro/skills/`) and read the relevant ones before working.
+
+- For Scala 3 and ZIO code (writing or reviewing it), follow `zen-of-scala`.
+- For design, domain modeling, effects and testing strategy, follow `zen-of-james`.
+- For project and build conventions, follow `zen-of-projects`.
 
 ## Exceptions to zen-of-projects
 
@@ -21,16 +22,12 @@ project-specific facts and exceptions.
 
 ## Build, Test & Dev Workflow
 
-- Use the MCP server named `sbta` (`http://127.0.0.1:5121/`) for sbt interactions: `sbt-task` (separate commands with `;`),
-  `list-tasks`, `check` (`"scope":"module"` after API changes), and `glob-search` / `inspect` /
-  `symbol-location` plus the proxied javadocs.dev tools for symbol lookups. If it is unavailable,
-  say so and fall back to the `./sbta` launcher.
-  - Kiro: HTTP entry in `.kiro/settings/mcp.json`; start sbt first.
-  - Claude Code: `.mcp.json` runs `.claude/sbt-mcp-stdio.sh` (approved in `.claude/settings.json`),
-    a stdio bridge that starts a foreground sbt in cloud sessions (`CLAUDE_CODE_REMOTE=true`) and
-    connects to an already-running sbt locally. Its tools are deferred: load them with ToolSearch
-    (search `sbta`). Diagnostics: `/tmp/sbt-mcp-stdio.log`,
-    `/tmp/sbt-mcp-server.log`.
+- Use the MCP server named `sbta` for sbt interactions. It is the stdio server `./sbta --mcp` (configured in
+  `.mcp.json` for Claude Code and `.kiro/settings/mcp.json` for Kiro), which starts sbt itself when it isn't
+  running. In Claude Code its tools are deferred: load them with ToolSearch (search `sbta`). Prefer the
+  structured tools (`compile`, `test` with `full`, `check` after edits, ...) and `sbt-task` for anything else.
+  If it is unavailable, say so and fall back to the `./sbta` launcher. Logs: `project/target/sbta/mcp.log`
+  and `project/target/sbta/boot.log`.
 - Commands (CLI fallback form):
   - `./sbta "Test / compile"` — compile main + tests.
   - `./sbta testFull` — full test suite (what CI runs).
@@ -40,6 +37,10 @@ project-specific facts and exceptions.
 - Most tests hit the real (free) Maven Central over the network. The Sonatype `upload and verify`
   test publishes for real and only runs when `OSS_DEPLOY_USERNAME` and `OSS_DEPLOY_PASSWORD` are
   set — do not set them unless explicitly asked.
+
+## Maintenance routine
+
+`.factory/MAINTENANCE.md`, run on a schedule by the factory.
 
 ## Releasing
 
