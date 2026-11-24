@@ -188,6 +188,33 @@ object JarCacheSpec extends ZIOSpecDefault:
       body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
     },
 
+    test("entrySize gives an entry's size, and fails with JarEntryNotFound for a missing path") {
+      val body = ZIO.scoped:
+        withCache: (cache, _) =>
+          defer:
+            val handle  = cache.get(gavA).run
+            val foo     = handle.entrySize("pkg/Foo.html").run
+            val missing = handle.entrySize("does-not-exist.html").either.run
+            assertTrue(
+              foo.contains(sampleSizes("pkg/Foo.html")),
+              missing.left.toOption.contains(JarCache.JarEntryNotFound(gavA, "does-not-exist.html")),
+            )
+      body.provide(Client.default, MavenCentral.MavenCentralRepo.live)
+    },
+
+    test("readFully reads exactly the bytes, whatever size the jar records") {
+      val data  = Array.tabulate[Byte](100_000)(i => (i % 251).toByte)
+      def read(size: Long) = JarCache.readFully(java.io.ByteArrayInputStream(data), size)
+      assertTrue(
+        read(data.length.toLong).sameElements(data), // recorded correctly
+        read(-1L).sameElements(data),                // not recorded
+        read(10L).sameElements(data),                // recorded too small
+        read(200_000L).sameElements(data),           // recorded too large
+        read(0L).sameElements(data),
+        JarCache.readFully(java.io.ByteArrayInputStream(Array.emptyByteArray), 0L).isEmpty,
+      )
+    },
+
     test("readEntry on a missing path fails with JarEntryNotFound") {
       val body = ZIO.scoped:
         withCache: (cache, _) =>

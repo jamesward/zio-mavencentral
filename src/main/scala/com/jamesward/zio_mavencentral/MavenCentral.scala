@@ -11,7 +11,7 @@ import zio.http.codec.PathCodec
 import zio.schema.{Schema, derived}
 import zio.schema.annotation.description
 import zio.stream.{ZPipeline, ZSink, ZStream}
-import zio.{Chunk, ChunkBuilder, Duration, IO, LogAnnotation, Ref, Schedule, Scope, Trace, ZIO, ZLayer, durationInt, duration2DurationOps}
+import zio.{Chunk, ChunkBuilder, Duration, IO, LogAnnotation, Ref, Schedule, Scope, Trace, UIO, ZIO, ZLayer, durationInt, duration2DurationOps}
 
 import java.io.{File, IOException}
 import java.nio.charset.StandardCharsets
@@ -24,16 +24,14 @@ import scala.xml.Elem
 
 object MavenCentral:
 
-  // Default Maven Central mirrors, in preference order. The primary
-  // (`repo1.maven.org`) and the Apache alias (`repo.maven.apache.org`) are
-  // backed by the same Sonatype infrastructure, so a real second source is
-  // needed for IP-based throttling to actually have somewhere to go — Google
-  // hosts a public GCS mirror that we slot in second.
+  // Maven Central's URLs. repo1 (behind Cloudflare) is the source of truth.
+  // Google's GCS copy is the mirror Central lists in its own
+  // `/.meta/repository-metadata.xml`. `repo.maven.apache.org` is the same
+  // Cloudflare endpoint as repo1 (same IPs), so it's no fallback and isn't used
+  // by default. See `defaultMirrorSpecs` for how they're used.
   val primaryUri: URL  = URL.decode("https://repo1.maven.org/maven2/").toOption.get
-  val gcsMirror: URL   = URL.decode("https://maven-central.storage.googleapis.com/maven2/").toOption.get
+  val gcsMirror: URL   = URL.decode("https://maven-central.storage-download.googleapis.com/maven2/").toOption.get
   val apacheAlias: URL = URL.decode("https://repo.maven.apache.org/maven2/").toOption.get
-
-  val defaultMirrors: List[URL] = List(primaryUri, gcsMirror, apacheAlias)
 
   opaque type GroupId = String
   object GroupId:
@@ -120,7 +118,10 @@ object MavenCentral:
     val schema: Schema[GroupArtifactVersion] = MavenCentralSchemas.groupArtifactVersion
     given Schema[GroupArtifactVersion] = schema
 
-  case class WithCacheInfo[A](value: A, maybeLastModified: Option[ZonedDateTime], maybeEtag: Option[Header.ETag])
+  /** A value with the validators of the response it came from, and the URL that
+   *  served it (`servedBy` is on a fallback mirror when the authoritative one
+   *  couldn't answer, which a cache may want to keep for less time). */
+  case class WithCacheInfo[A](value: A, maybeLastModified: Option[ZonedDateTime], maybeEtag: Option[Header.ETag], servedBy: Option[URL] = None)
 
   /**
    * Cache metadata extracted from an HTTP response when downloading a jar.
@@ -135,6 +136,10 @@ object MavenCentral:
   /** No published versions for this `GroupArtifact` (Maven Central returned an
    *  empty version list). Surfaced by [[latestOrFail]]. */
   case class LatestNotFound(groupArtifact: GroupArtifact)
+  /** Maven Central couldn't be reached for this `GroupArtifact`'s versions: a
+   *  network failure, or a 5xx / 429 / 403 from every mirror. Temporary, so
+   *  worth retrying. Surfaced by [[latestOrFail]]. */
+  case class LatestUnavailable(groupArtifact: GroupArtifact, reason: String)
   /** A transient HTTP failure that's worth retrying — 5xx server errors,
    *  429 Too Many Requests, or 403 Forbidden. Maven Central throttles
    *  aggressive clients with both 429s and 403s; treating both as
@@ -143,6 +148,15 @@ object MavenCentral:
   case class TemporaryServerError(response: Response) extends Throwable(s"${response.status.code}: ${response.status.text}")
   private case class UnknownError(response: Response) extends Throwable(response.status.text)
   private case class ParseError(t: Throwable) extends Throwable(t)
+
+  /** Status codes meaning Maven Central has nothing at the path: 404, plus the
+   *  400 / 414 it answers for a path it can't parse (a NUL or invalid UTF-8 in
+   *  a segment, a segment over ~1,100 characters). Such a path can't name a
+   *  published artifact, so it's "not found", not an error. The mirrors
+   *  disagree on which inputs get 400 vs 404 (repo1 answers 400 for a NUL, the
+   *  GCS mirror 404; the reverse for a newline). */
+  private[zio_mavencentral] def isAbsent(status: Status): Boolean =
+    status == Status.NotFound || status == Status.BadRequest || status == Status.RequestUriTooLong
 
   /** Status codes that should cause a fallback to the next mirror and
    *  count toward tripping the per-mirror circuit breaker. Permanent 4xx
@@ -155,7 +169,7 @@ object MavenCentral:
   // Promote a non-success response to either a TemporaryServerError (retryable
   // / fallback-worthy) or an UnknownError (terminal). Centralizing the rule
   // means new fallback-worthy status codes only need to be added in one place.
-  private def temporaryOrUnknown(response: Response): Throwable =
+  private[zio_mavencentral] def temporaryOrUnknown(response: Response): Throwable =
     if isFallbackWorthy(response.status) then TemporaryServerError(response)
     else UnknownError(response)
 
@@ -208,145 +222,348 @@ object MavenCentral:
                                 method: Method = Method.GET,
                                 headers: Headers = Headers.empty,
                                 content: Body = Body.empty,
+                                kind: RequestKind = RequestKind.Fresh,
                               )(implicit trace: Trace): ZIO[MavenCentralRepo, Throwable, (Response, URL)] =
-      ZIO.serviceWithZIO[MavenCentralRepo](_.request(path, method, headers, content))
+      ZIO.serviceWithZIO[MavenCentralRepo](_.request(path, method, headers, content, kind))
 
   /**
-   * Service that performs Maven Central requests with status-aware mirror
-   * fallback and per-mirror circuit breakers.
+   * What a request reads, which decides the order the mirrors are tried in.
+   * The authoritative mirror (repo1) is the only one whose "not found" is
+   * believed: a fallback mirror (Google's GCS copy) lags new artifacts by up to
+   * a day and serves no directory listings.
+   */
+  enum RequestKind:
+    /** Changing metadata (`maven-metadata.xml`): the authoritative mirror first, for freshness. */
+    case Fresh
+    /** A published file that never changes (jar, POM): fallback mirrors first, to keep the
+     *  bulk of the bytes off repo1; the authoritative mirror when they don't have it. */
+    case Immutable
+    /** A directory listing: only mirrors that serve HTML listings (see [[MavenCentralRepo.list]]). */
+    case Listing
+
+  /** How a mirror can list a directory's subdirectories. */
+  enum Listings:
+    /** An HTML index page at the directory's URL (repo1). */
+    case Html
+    /** A GCS bucket's JSON listing API (`prefix` + `delimiter=/`), at `api`. */
+    case GcsBucket(api: URL, bucket: String, prefix: String)
+    /** None. */
+    case Unsupported
+
+  /** One Maven Central mirror. Exactly one should be `authoritative`. */
+  final case class Mirror(url: URL, authoritative: Boolean, listings: Listings)
+
+  /** repo1: authoritative, fresh, serves listings, behind Cloudflare. */
+  val primaryMirror: Mirror = Mirror(primaryUri, authoritative = true, Listings.Html)
+
+  /** Google's GCS copy of Maven Central (the mirror Central itself lists in
+   *  `/.meta/repository-metadata.xml`). Reliable, but lags new artifacts and has
+   *  no HTML listings; its bucket API lists directories. */
+  val gcsMirrorSpec: Mirror = Mirror(gcsMirror, authoritative = false,
+    Listings.GcsBucket(URL.decode("https://storage.googleapis.com/storage/v1/b/").toOption.get, "maven-central", "maven2/"))
+
+  val defaultMirrorSpecs: List[Mirror] = List(primaryMirror, gcsMirrorSpec)
+
+  /** A fallback mirror doesn't have the path, and the authoritative mirror
+   *  couldn't be asked (failing, or over its request budget). Not a "not found":
+   *  the path may exist but be too new for the fallback. Temporary. */
+  final case class NotFoundOnFallback(url: URL)
+    extends IOException(s"${url.encode} isn't on the fallback mirror, and the authoritative mirror couldn't confirm it")
+
+  /** Every mirror that could answer is failing or skipped. Temporary. */
+  final case class AllMirrorsUnavailable(path: Path)
+    extends IOException(s"no Maven Central mirror could answer for ${path.encode}")
+
+  /** The result of listing a directory: its subdirectory names, or nothing there
+   *  (only the authoritative mirror can say that). */
+  enum Listed:
+    case Names(names: Seq[String], maybeLastModified: Option[ZonedDateTime], url: URL)
+    case Absent(url: URL)
+
+  /** A mirror's breaker trips when at least `failureRate` of its calls fail within
+   *  `window`, once it has had at least `minCalls` (rezilience evaluates a full window). */
+  final case class BreakerSettings(failureRate: Double = 0.5, window: Duration = 30.seconds, minCalls: Int = 10)
+
+  /** How many requests per second repo1 gets at most, and how long a request
+   *  that needs its answer (an authoritative "not found") waits for budget. */
+  final case class RateLimit(perSecond: Double = 20, burst: Int = 50, authoritativeWait: Duration = 2.seconds)
+
+  /**
+   * Maven Central requests with mirror fallback, per-mirror circuit breakers, and a
+   * request budget for the authoritative mirror.
    *
-   * Wiring
-   * ------
-   * One [[nl.vroste.rezilience.CircuitBreaker]] per configured mirror. A request walks the
-   * mirror list in order. For each mirror:
+   * Order (see [[RequestKind]]):
+   *   - `Fresh`: repo1, then GCS. If repo1 is over budget or failing, GCS answers;
+   *     a GCS "not found" then waits briefly for repo1's budget and asks it, and
+   *     fails with [[NotFoundOnFallback]] (temporary) if it still can't.
+   *   - `Immutable`: GCS, then repo1 (waiting briefly for budget) when GCS doesn't
+   *     have the file or fails.
+   *   - `Listing`: mirrors that serve HTML listings only.
    *
-   *   - If its breaker is open, the call fails fast with `CircuitBreakerOpen`
-   *     and we move to the next mirror without ever touching the network.
-   *   - Otherwise the request is issued. A response with a status matching
-   *     [[isFallbackWorthy]] (5xx / 429 / 403) is treated as a failure:
-   *     it counts toward tripping the breaker and we move on to the next
-   *     mirror. An I/O error counts the same way.
-   *   - Anything else (success, 404, other 4xx) is returned to the caller.
-   *
-   * If every mirror fails, the first transport-level error is surfaced.
-   *
-   * Semantics
-   * ---------
-   * Mirror fallback is per-call; circuit breaker state is per-mirror and
-   * shared across all calls for the lifetime of the layer. After
-   * `maxFailures` consecutive fallback-worthy failures, the breaker opens
-   * and that mirror is skipped until `resetTimeout` has elapsed (with
-   * exponential backoff on repeated open/half-open/open cycles).
+   * Only the authoritative mirror's 404 / 400 / 414 reaches the caller as a status;
+   * a fallback's is never final. A response with a status matching
+   * [[isFallbackWorthy]] (5xx / 429 / 403), an I/O error, or a timeout counts
+   * against that mirror's breaker and moves on. A breaker trips when at least half
+   * of its calls fail over 30 s (with at least 10 calls), probes again after 30 s,
+   * and backs off to 10 minutes. Breaker state changes are logged at WARN. When no
+   * mirror can answer, the call fails with [[AllMirrorsUnavailable]].
    */
   trait MavenCentralRepo:
+    /** A request whose body is read into memory. */
     def request(
       path: Path,
       method: Method = Method.GET,
       headers: Headers = Headers.empty,
       content: Body = Body.empty,
+      kind: RequestKind = RequestKind.Fresh,
     ): ZIO[Any, Throwable, (Response, URL)]
+
+    /** A request whose body streams; the response lives until the `Scope` closes. */
+    def streaming(
+      path: Path,
+      method: Method = Method.GET,
+      headers: Headers = Headers.empty,
+      kind: RequestKind = RequestKind.Immutable,
+    ): ZIO[Scope, Throwable, (Response, URL)]
+
+    /** A directory's subdirectory names: the HTML listing of a mirror that has
+     *  one, else a GCS bucket listing (within `timeout`). */
+    def list(path: Path, timeout: Duration = 10.seconds): ZIO[Any, Throwable, Listed]
+
+    /** Requests answered by a fallback because the authoritative mirror was over
+     *  its budget, since the layer started. */
+    def rateLimited: UIO[Long]
 
   object MavenCentralRepo:
 
     // Required for matching `case CircuitBreakerOpen` under -language:strictEquality.
     private given CanEqual[CircuitBreaker.CircuitBreakerCallError[?], CircuitBreaker.CircuitBreakerCallError[?]] = CanEqual.derived
+    private given CanEqual[RequestKind, RequestKind] = CanEqual.derived
+    private given CanEqual[Listings, Listings] = CanEqual.derived
 
     /** Errors that count toward tripping the per-mirror circuit breaker. */
     private val trippingError: PartialFunction[Throwable, Boolean] =
       case _: TemporaryServerError => true
       case _: IOException          => true
 
-    private final case class Mirror(baseUrl: URL, breaker: CircuitBreaker[Throwable])
+    private final case class Live(mirror: Mirror, breaker: CircuitBreaker[Throwable])
 
-    /**
-     * Default layer: the standard 3-mirror list, 10 successive
-     * fallback-worthy failures to trip a mirror's breaker, and a 1-hour
-     * reset timeout that doubles on repeated trips up to a 24-hour cap.
-     *
-     * Captures the `Client` from the environment at layer-construction
-     * time, so every callsite of [[MavenCentralRepo]] only needs
-     * `MavenCentralRepo` in its requirement type — not `Client`.
-     */
+    /** Default layer: repo1 (authoritative) and Google's GCS mirror, a 5 s
+     *  per-attempt timeout, and a 20 requests/s (burst 50) budget for repo1. */
     val live: ZLayer[Client, Nothing, MavenCentralRepo] =
       custom()
 
     /**
      * Build a layer with custom mirrors and tuning.
      *
-     * @param mirrors        Mirror base URLs in preference order.
-     * @param maxFailures    Successive fallback-worthy failures before the
-     *                       breaker for a single mirror trips.
-     * @param resetMin       Initial open-state duration before probing again.
-     * @param resetMax       Cap on the open-state duration.
-     * @param requestTimeout Per-mirror-attempt wall-clock timeout. A request
-     *                       that doesn't complete within this bound is failed
-     *                       with an `IOException` (rather than hanging the
-     *                       fiber forever on a stalled/throttled connection).
-     *                       Because a timeout is a `trippingError`, it both
-     *                       counts toward tripping the mirror's breaker and
-     *                       triggers fallback to the next mirror.
+     * @param mirrors        Mirrors; exactly one should be authoritative.
+     * @param requestTimeout Per-attempt timeout to get a response (a whole body
+     *                       for [[MavenCentralRepo.request]], the headers for
+     *                       [[MavenCentralRepo.streaming]]). A timeout counts
+     *                       against the mirror's breaker and moves on.
+     * @param rateLimit      The authoritative mirror's request budget.
+     * @param resetMin       Open-state duration before a breaker probes again.
+     * @param resetMax       Cap on the open-state duration as it backs off.
+     * @param breaker        When a mirror's breaker trips.
      */
     def custom(
-      mirrors: List[URL]       = defaultMirrors,
-      maxFailures: Int         = 10,
-      resetMin: Duration       = 1.hour,
-      resetMax: Duration       = 24.hours,
-      requestTimeout: Duration = 30.seconds,
+      mirrors: List[Mirror]    = defaultMirrorSpecs,
+      requestTimeout: Duration = 5.seconds,
+      rateLimit: RateLimit     = RateLimit(),
+      resetMin: Duration       = 30.seconds,
+      resetMax: Duration       = 10.minutes,
+      breaker: BreakerSettings = BreakerSettings(),
     ): ZLayer[Client, Nothing, MavenCentralRepo] =
       ZLayer.scoped:
         defer:
           val client = ZIO.service[Client].run
-          val builtMirrors = ZIO.foreach(mirrors): url =>
-            CircuitBreaker.withMaxFailures[Throwable](
-              maxFailures = maxFailures,
-              resetPolicy = Retry.Schedules.exponentialBackoff(resetMin, resetMax),
-              isFailure   = trippingError,
-            ).map(Mirror(url, _))
+          val built = ZIO.foreach(mirrors): mirror =>
+            CircuitBreaker.make[Throwable](
+              trippingStrategy = TrippingStrategy.failureRate(breaker.failureRate, breaker.window, breaker.minCalls, 10),
+              resetPolicy      = Retry.Schedules.exponentialBackoff(resetMin, resetMax),
+              isFailure        = trippingError,
+            ).map(Live(mirror, _))
           .run
-          Live(client, builtMirrors, requestTimeout)
+          ZIO.foreachDiscard(built)(logStateChanges).run
+          val bucket = TokenBucket.make(rateLimit.perSecond, rateLimit.burst).run
+          val limited = Ref.make(0L).run
+          Repo(client, built, requestTimeout, rateLimit, bucket, limited)
 
-    private final class Live(client: Client, mirrors: List[Mirror], requestTimeout: Duration) extends MavenCentralRepo:
-      def request(
-        path: Path,
-        method: Method = Method.GET,
-        headers: Headers = Headers.empty,
-        content: Body = Body.empty,
-      ): ZIO[Any, Throwable, (Response, URL)] =
-        // Fold over mirrors, remembering the first transport-level error so
-        // we can surface it if every mirror is exhausted.
-        def attempt(remaining: List[Mirror], firstErr: Option[Throwable]): ZIO[Any, Throwable, (Response, URL)] =
-          remaining match
-            case Nil =>
-              ZIO.fail(firstErr.getOrElse(new RuntimeException("No Maven Central mirrors configured")))
-            case Mirror(base, breaker) :: rest =>
-              val req = Request(method = method, url = base.addPath(path), headers = headers, body = content)
-              breaker(
-                client.batched(req)
-                  // Bound each mirror attempt so a stalled/throttled connection
-                  // can't hang the fiber indefinitely. A timeout surfaces as an
-                  // IOException — a `trippingError` — so it counts toward the
-                  // breaker and triggers fallback to the next mirror.
-                  .timeoutFail(IOException(s"Request to ${req.url} timed out after ${requestTimeout.render}"))(requestTimeout)
-                  .flatMap: resp =>
-                    if isFallbackWorthy(resp.status) then
-                      ZIO.fail(temporaryOrUnknown(resp))
-                    else
-                      ZIO.succeed(resp -> req.url)
-              ).foldZIO(
-                {
-                  case CircuitBreakerOpen =>
-                    ZIO.logAnnotate(LogAnnotation("mirror", base.toString))(ZIO.logInfo("Circuit open, skipping")).flatMap(_ => attempt(rest, firstErr))
-                  case WrappedError(t)    =>
-                    ZIO.logAnnotate(
-                      LogAnnotation("mirror", base.toString),
-                      LogAnnotation("errorClass", t.getClass.getSimpleName),
-                      LogAnnotation("error", Option(t.getMessage).getOrElse("-")),
-                    )(ZIO.logWarning("Mirror failed"))
-                      .flatMap(_ => attempt(rest, firstErr.orElse(Some(t))))
-                },
-                ok => ZIO.succeed(ok)
-              )
-        attempt(mirrors, None)
+    private def logStateChanges(live: Live): ZIO[Scope, Nothing, Unit] =
+      live.breaker.stateChanges.flatMap: changes =>
+        changes.take.flatMap: change =>
+          ZIO.logAnnotate(LogAnnotation("mirror", live.mirror.url.encode), LogAnnotation("state", change.to.toString))(
+            ZIO.logWarning("Mirror circuit breaker changed state"))
+        .forever.forkScoped.unit
+
+    /** A token bucket: `perSecond` tokens refill continuously up to `burst`. */
+    private final class TokenBucket(state: Ref[(Double, Long)], perSecond: Double, burst: Int):
+      def tryAcquire: UIO[Boolean] =
+        ZIO.succeed(java.lang.System.nanoTime()).flatMap: now =>
+          state.modify: (tokens, last) =>
+            val refilled = math.min(burst.toDouble, tokens + (now - last) / 1e9 * perSecond)
+            if refilled >= 1 then (true, (refilled - 1, now)) else (false, (refilled, now))
+
+      def acquireWithin(wait: Duration): UIO[Boolean] =
+        tryAcquire.repeat(Schedule.recurWhile[Boolean](!_) && Schedule.spaced(50.millis) && Schedule.upTo(wait)).map(_._1)
+
+    private object TokenBucket:
+      def make(perSecond: Double, burst: Int): UIO[TokenBucket] =
+        Ref.make((burst.toDouble, java.lang.System.nanoTime())).map(TokenBucket(_, perSecond, burst))
+
+    private final class Repo(
+      client: Client,
+      mirrors: List[Live],
+      requestTimeout: Duration,
+      rateLimit: RateLimit,
+      bucket: TokenBucket,
+      limited: Ref[Long],
+    ) extends MavenCentralRepo:
+
+      private val authoritative = mirrors.filter(_.mirror.authoritative)
+      private val fallbacks     = mirrors.filterNot(_.mirror.authoritative)
+
+      def rateLimited: UIO[Long] = limited.get
+
+      /** One attempt: the response, or a failure counted against the mirror's breaker. */
+      private def attempt[R](live: Live, send: URL => ZIO[R, Throwable, Response], path: Path): ZIO[R, CircuitBreaker.CircuitBreakerCallError[Throwable], (Response, URL)] =
+        val url = live.mirror.url.addPath(path)
+        live.breaker(
+          send(url)
+            .timeoutFail(IOException(s"Request to ${url.encode} timed out after ${requestTimeout.render}"))(requestTimeout)
+            .flatMap: response =>
+              if isFallbackWorthy(response.status) then ZIO.fail(temporaryOrUnknown(response))
+              else ZIO.succeed(response -> url)
+        )
+
+      private def logged[R](live: Live)(result: ZIO[R, CircuitBreaker.CircuitBreakerCallError[Throwable], (Response, URL)]): ZIO[R, Option[Throwable], (Response, URL)] =
+        result.foldZIO(
+          {
+            case CircuitBreakerOpen =>
+              ZIO.logAnnotate(LogAnnotation("mirror", live.mirror.url.encode))(ZIO.logDebug("Circuit open, skipping")) *> ZIO.fail(None)
+            case WrappedError(t) =>
+              ZIO.logAnnotate(
+                LogAnnotation("mirror", live.mirror.url.encode),
+                LogAnnotation("errorClass", t.getClass.getSimpleName),
+                LogAnnotation("error", Option(t.getMessage).getOrElse("-")),
+              )(ZIO.logWarning("Mirror failed")) *> ZIO.fail(Some(t))
+          },
+          ZIO.succeed(_),
+        )
+
+      /** Ask the authoritative mirror, within its budget (waiting up to `wait`). */
+      private def askAuthoritative[R](send: URL => ZIO[R, Throwable, Response], path: Path, wait: Duration): ZIO[R, Option[Throwable], (Response, URL)] =
+        authoritative.headOption match
+          case None => ZIO.fail(None)
+          case Some(live) =>
+            val permit = if wait <= Duration.Zero then bucket.tryAcquire else bucket.acquireWithin(wait)
+            permit.flatMap:
+              case true  => logged(live)(attempt(live, send, path))
+              case false => limited.update(_ + 1) *> ZIO.fail(None)
+
+      /** Fallback mirrors in order: the first positive answer, or the URL of the first that doesn't have it. */
+      private def askFallbacks[R](send: URL => ZIO[R, Throwable, Response], path: Path, remaining: List[Live]): ZIO[R, Option[Throwable], Either[URL, (Response, URL)]] =
+        remaining match
+          case Nil => ZIO.fail(None)
+          case live :: rest =>
+            logged(live)(attempt(live, send, path)).foldZIO(
+              err => askFallbacks(send, path, rest).mapError(_.orElse(err)),
+              (response, url) =>
+                if isAbsent(response.status) then askFallbacks(send, path, rest).map(_.left.map(_ => url)).orElseSucceed(Left(url))
+                else ZIO.succeed(Right(response -> url)),
+            )
+
+      private def run[R](send: URL => ZIO[R, Throwable, Response], path: Path, kind: RequestKind): ZIO[R, Throwable, (Response, URL)] =
+        def unavailable(err: Option[Throwable]): Throwable = err.getOrElse(AllMirrorsUnavailable(path))
+        // The authoritative mirror, then fallbacks; a fallback's "not found" asks the authoritative one again.
+        val authoritativeFirst =
+          askAuthoritative(send, path, Duration.Zero).catchAll: firstErr =>
+            askFallbacks(send, path, fallbacks).foldZIO(
+              err => ZIO.fail(unavailable(firstErr.orElse(err))),
+              {
+                case Right(ok) => ZIO.succeed(ok)
+                case Left(fallbackUrl) =>
+                  // Only retry repo1 if it was skipped for budget, not if it just failed.
+                  if firstErr.isDefined then ZIO.fail(NotFoundOnFallback(fallbackUrl))
+                  else askAuthoritative(send, path, rateLimit.authoritativeWait).mapError(_ => NotFoundOnFallback(fallbackUrl))
+              },
+            )
+        kind match
+          case RequestKind.Fresh => authoritativeFirst
+          case RequestKind.Listing =>
+            // Only HTML-listing mirrors (repo1), within its budget; a GCS bucket listing is `list`'s fallback.
+            mirrors.find(_.mirror.listings == Listings.Html) match
+              case None => ZIO.fail(AllMirrorsUnavailable(path))
+              case Some(lister) =>
+                bucket.acquireWithin(rateLimit.authoritativeWait).flatMap:
+                  case false => limited.update(_ + 1) *> ZIO.fail(AllMirrorsUnavailable(path))
+                  case true  =>
+                    logged(lister)(attempt(lister, send, path)).mapError(unavailable).flatMap: (response, url) =>
+                      if isAbsent(response.status) && !lister.mirror.authoritative then ZIO.fail(NotFoundOnFallback(url))
+                      else ZIO.succeed(response -> url)
+          case RequestKind.Immutable =>
+            askFallbacks(send, path, fallbacks).foldZIO(
+              _ => askAuthoritative(send, path, rateLimit.authoritativeWait).mapError(err => unavailable(err)),
+              {
+                case Right(ok) => ZIO.succeed(ok)
+                case Left(fallbackUrl) =>
+                  askAuthoritative(send, path, rateLimit.authoritativeWait).mapError(_ => NotFoundOnFallback(fallbackUrl))
+              },
+            )
+
+      def request(path: Path, method: Method, headers: Headers, content: Body, kind: RequestKind): ZIO[Any, Throwable, (Response, URL)] =
+        run(url => client.batched(Request(method = method, url = url, headers = headers, body = content)), path, kind)
+
+      def streaming(path: Path, method: Method, headers: Headers, kind: RequestKind): ZIO[Scope, Throwable, (Response, URL)] =
+        run(url => client(Request(method = method, url = url, headers = headers)), path, kind)
+
+      def list(path: Path, timeout: Duration): ZIO[Any, Throwable, Listed] =
+        val dir = path.addTrailingSlash
+        request(dir, kind = RequestKind.Listing).flatMap: (response, url) =>
+          if isAbsent(response.status) then ZIO.succeed(Listed.Absent(url))
+          else if response.status.isSuccess then
+            responseToNames(response).map(Listed.Names(_, response.header(Header.LastModified).map(_.value), url))
+          else ZIO.fail(temporaryOrUnknown(response))
+        .catchSome:
+          case e if trippingError.isDefinedAt(e) || e.isInstanceOf[AllMirrorsUnavailable] =>
+            bucketListing(path, timeout).someOrFail(e)
+
+      /** The first GCS bucket mirror's listing of `path`, if a mirror has one and answers in time. */
+      private def bucketListing(path: Path, timeout: Duration): ZIO[Any, Throwable, Option[Listed]] =
+        mirrors.collectFirst { case Live(Mirror(url, _, Listings.GcsBucket(api, bucket, prefix)), _) => (url, api, bucket, prefix) } match
+          case None => ZIO.none
+          case Some((mirrorUrl, api, bucket, prefix)) =>
+            val dirPrefix = prefix + path.dropLeadingSlash.addTrailingSlash.encode.stripPrefix("/")
+            def page(token: Option[String]): ZIO[Any, Throwable, (Seq[String], Option[String])] =
+              val params = QueryParams(Map(
+                "prefix" -> Chunk(dirPrefix), "delimiter" -> Chunk("/"), "maxResults" -> Chunk("1000"),
+                "fields" -> Chunk("prefixes,nextPageToken"),
+              ) ++ token.map(t => "pageToken" -> Chunk(t)))
+              val url = api.addPath(Path.decode(s"$bucket/o")).copy(queryParams = params)
+              client.batched(Request.get(url)).flatMap: response =>
+                if !response.status.isSuccess then ZIO.fail(temporaryOrUnknown(response))
+                else response.body.asString.map(parseBucketPage(dirPrefix))
+            def all(token: Option[String], acc: Seq[String]): ZIO[Any, Throwable, Seq[String]] =
+              page(token).flatMap: (names, next) =>
+                next.fold(ZIO.succeed(acc ++ names))(t => all(Some(t), acc ++ names))
+            all(None, Seq.empty)
+              .timeoutFail(IOException(s"GCS listing of ${path.encode} took over ${timeout.render}"))(timeout)
+              .flatMap: names =>
+                val url = mirrorUrl.addPath(path.addTrailingSlash)
+                // An empty listing on a fallback isn't proof the directory doesn't exist.
+                if names.isEmpty then ZIO.fail(NotFoundOnFallback(url))
+                else ZIO.some(Listed.Names(names, None, url))
+
+  /** The subdirectory names in one page of a GCS JSON listing (`{"prefixes":[…],"nextPageToken":…}`). */
+  private[zio_mavencentral] def parseBucketPage(dirPrefix: String)(json: String): (Seq[String], Option[String]) =
+    import zio.json.*
+    import zio.json.ast.Json
+    json.fromJson[Json].toOption match
+      case Some(Json.Obj(fields)) =>
+        val prefixes = fields.collectFirst { case ("prefixes", Json.Arr(ps)) => ps.collect { case Json.Str(p) => p } }.getOrElse(Chunk.empty)
+        val token    = fields.collectFirst { case ("nextPageToken", Json.Str(t)) => t }
+        (prefixes.map(_.stripPrefix(dirPrefix).stripSuffix("/")).filter(_.nonEmpty).toSeq, token)
+      case _ => (Seq.empty, None)
 
   // When a groupId path is *also* an artifact path (e.g. org.webjars:npm lives
   // at /org/webjars/npm/, sibling to every artifact in the org.webjars.npm
@@ -368,30 +585,24 @@ object MavenCentral:
           val body = response.body.asString.run
           val xml  = scala.xml.XML.loadString(body)
           (xml \ "versioning" \ "versions" \ "version").map(n => Version(n.text)).toSeq
-        case Status.NotFound =>
+        case status if isAbsent(status) =>
           ZIO.succeed(Seq.empty[Version]).run
         case _ =>
           ZIO.fail(temporaryOrUnknown(response)).run
 
   // Removes any versions found in this groupId
+    // While repo1 can't be asked, GCS's 404 for the group's metadata is unknown, not absent;
+    // treat it as "no versions" (a group-as-artifact's versions may then show as artifacts).
+    .catchSome:
+      case _: NotFoundOnFallback => ZIO.succeed(Seq.empty[Version])
+
   def searchArtifacts(groupId: GroupId): ZIO[MavenCentralRepo, GroupIdNotFoundError | TemporaryServerError | Throwable, WithCacheInfo[Seq[ArtifactId]]] =
-    val path = artifactPath(groupId).addTrailingSlash
-    val allFilesReq = Client.requestWithFallback(path).map(_._1)
-    allFilesReq.zipWithPar(versionsAtGroupPath(groupId)):
-      (allFilesResp, versions) =>
-        allFilesResp.status match
-          case Status.NotFound =>
-            ZIO.fail(GroupIdNotFoundError(groupId))
-          case s if s.isSuccess =>
-            responseToNames(allFilesResp).map:
-              names =>
-                WithCacheInfo(
-                  names.diff(versions).map(ArtifactId(_)),
-                  allFilesResp.header(Header.LastModified).map(_.value),
-                  allFilesResp.header(Header.ETag)
-                )
-          case _ =>
-            ZIO.fail(temporaryOrUnknown(allFilesResp))
+    val listing = ZIO.serviceWithZIO[MavenCentralRepo](_.list(artifactPath(groupId)))
+    listing.zipWithPar(versionsAtGroupPath(groupId)):
+      case (Listed.Absent(_), _) =>
+        ZIO.fail(GroupIdNotFoundError(groupId))
+      case (Listed.Names(names, lastModified, url), versions) =>
+        ZIO.succeed(WithCacheInfo(names.diff(versions).map(ArtifactId(_)), lastModified, None, Some(url)))
     .flatten
 
 
@@ -404,18 +615,14 @@ object MavenCentral:
   def searchVersions(groupId: GroupId, artifactId: ArtifactId): ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, WithCacheInfo[Seq[Version]]] =
     defer:
       val metadata = mavenMetadata(groupId, artifactId).run
-      val versions = metadata.value \ "versioning" \ "versions" \ "version"
-      WithCacheInfo(
-        newestFirst(versions.map(n => Version(n.text))),
-        metadata.maybeLastModified,
-        metadata.maybeEtag,
-      )
+      WithCacheInfo(versionsOf(metadata.value), metadata.maybeLastModified, metadata.maybeEtag, metadata.servedBy)
 
   def isModifiedSince(dateTime: ZonedDateTime, groupId: GroupId, maybeArtifactId: Option[ArtifactId] = None):
     ZIO[MavenCentralRepo, GroupIdNotFoundError | GroupIdOrArtifactIdNotFoundError | Throwable, Boolean] =
       defer:
         val path = maybeArtifactId.fold(artifactPath(groupId).addTrailingSlash)(artifactId => artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml")
-        val (response, _) = Client.requestWithFallback(path, Method.HEAD, Headers(Header.IfModifiedSince(dateTime))).run
+        val kind = if maybeArtifactId.isEmpty then RequestKind.Listing else RequestKind.Fresh
+        val (response, _) = Client.requestWithFallback(path, Method.HEAD, Headers(Header.IfModifiedSince(dateTime)), kind = kind).run
         response.status match
           case Status.Ok =>
             // workaround for MavenCentral exact time matching on file not working correctly
@@ -424,7 +631,7 @@ object MavenCentral:
             else
               ZIO.succeed(true).run
           case Status.NotModified => ZIO.succeed(false).run
-          case Status.NotFound => ZIO.fail(maybeArtifactId.fold(GroupIdNotFoundError(groupId))(GroupIdOrArtifactIdNotFoundError(groupId, _))).run
+          case status if isAbsent(status) => ZIO.fail(maybeArtifactId.fold(GroupIdNotFoundError(groupId))(GroupIdOrArtifactIdNotFoundError(groupId, _))).run
           case _ => ZIO.fail(temporaryOrUnknown(response)).run
 
   /** Distinct versions sorted newest first by [[Version.ordering]]. */
@@ -454,19 +661,21 @@ object MavenCentral:
    * Resolve the latest published version for a `GroupArtifact`, with a
    * typed failure channel. Equivalent to:
    *   `latest(g, a, includePreReleases).someOrFail(LatestNotFound(ga))`
-   * with throwables `orDie`'d. Convenient for callers that want a clean
-   * `ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | LatestNotFound, Version]`.
+   * with upstream failures typed as [[LatestUnavailable]] and any other
+   * throwable `orDie`'d.
    *
    * Transient upstream failures (5xx / 429 / 403, network errors) are
    * handled by [[MavenCentralRepo]]'s mirror fallback + circuit breaker,
-   * not by per-call retries.
+   * not by per-call retries; when every mirror fails, the result is
+   * [[LatestUnavailable]].
    */
   def latestOrFail(groupArtifact: GroupArtifact, includePreReleases: Boolean = false):
-      ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | LatestNotFound, Version] =
+      ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | LatestNotFound | LatestUnavailable, Version] =
     latest(groupArtifact.groupId, groupArtifact.artifactId, includePreReleases)
       .catchAll:
-        case t: Throwable                        => ZIO.die(t)
-        case e: GroupIdOrArtifactIdNotFoundError => ZIO.fail(e)
+        case e: GroupIdOrArtifactIdNotFoundError                => ZIO.fail(e)
+        case t: Throwable if JarCache.isUpstreamFailure(t)      => ZIO.fail(LatestUnavailable(groupArtifact, JarCache.describeUpstreamFailure(t)))
+        case t: Throwable                                       => ZIO.die(t)
       .someOrFail(LatestNotFound(groupArtifact))
 
   def isArtifact(groupId: GroupId, artifactId: ArtifactId): ZIO[MavenCentralRepo, Throwable, Boolean] =
@@ -480,48 +689,68 @@ object MavenCentral:
 
   def artifactExists(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[MavenCentralRepo, Throwable, Boolean] =
     defer:
-      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))).addTrailingSlash
-      val (response, _) = Client.requestWithFallback(path, Method.HEAD).run
+      // The POM, not the version directory: every mirror has POMs, only repo1 has directory pages.
+      val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version.pom"
+      val (response, _) = Client.requestWithFallback(path, Method.HEAD, kind = RequestKind.Immutable).run
       response.status.isSuccess
 
   def pom(groupId: GroupId, artifactId: ArtifactId, version: Version): ZIO[MavenCentralRepo, NotFoundError | TemporaryServerError | Throwable, Elem] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / s"$artifactId-$version.pom"
-      val (response, url) = Client.requestWithFallback(path, Method.GET).run
+      val (response, url) = Client.requestWithFallback(path, Method.GET, kind = RequestKind.Immutable).run
       response.status match
         case status if status.isSuccess =>
           val body = response.body.asString.run
           scala.xml.XML.loadString(body)
-        case Status.NotFound =>
+        case status if isAbsent(status) =>
           ZIO.fail(NotFoundError(groupId, artifactId, version)).run
         case _ =>
           ZIO.fail(temporaryOrUnknown(response)).run
 
   def mavenMetadata(groupId: GroupId, artifactId: ArtifactId): ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, WithCacheInfo[Elem]] =
+    mavenMetadataIfModified(groupId, artifactId, None, None).someOrElseZIO(ZIO.dieMessage("304 without validators"))
+
+  /**
+   * `maven-metadata.xml`, unless it is unchanged since a copy with these validators:
+   * `None` for a `304 Not Modified`. A cache revalidates with this, so an unchanged
+   * artifact costs a 304 instead of the whole file.
+   */
+  def mavenMetadataIfModified(groupId: GroupId, artifactId: ArtifactId, etag: Option[Header.ETag], lastModified: Option[ZonedDateTime]):
+      ZIO[MavenCentralRepo, GroupIdOrArtifactIdNotFoundError | TemporaryServerError | Throwable, Option[WithCacheInfo[Elem]]] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId))) / "maven-metadata.xml"
-      val (response, url) = Client.requestWithFallback(path, Method.GET).run
+      val validators = Headers(
+        etag.map(e => Header.Custom(Header.IfNoneMatch.name, e.renderedValue)).toList ++ lastModified.map(Header.IfModifiedSince(_)).toList
+      )
+      val (response, url) = Client.requestWithFallback(path, Method.GET, validators).run
       response.status match
+        case Status.NotModified =>
+          None
         case status if status.isSuccess =>
           val body = response.body.asString.run
-          WithCacheInfo(
+          Some(WithCacheInfo(
             scala.xml.XML.loadString(body),
             response.header(Header.LastModified).map(_.value),
-            response.header(Header.ETag)
-          )
-        case Status.NotFound =>
+            response.header(Header.ETag),
+            Some(url),
+          ))
+        case status if isAbsent(status) =>
           ZIO.fail(GroupIdOrArtifactIdNotFoundError(groupId, artifactId)).run
         case _ =>
           ZIO.fail(temporaryOrUnknown(response)).run
 
+  /** The versions listed in a `maven-metadata.xml`, newest first. */
+  def versionsOf(metadata: Elem): Seq[Version] =
+    newestFirst((metadata \ "versioning" \ "versions" \ "version").map(n => Version(n.text)))
+
   private def artifactUrl(groupId: GroupId, artifactId: ArtifactId, version: Version)(filename: String): ZIO[MavenCentralRepo, NotFoundError | TemporaryServerError | Throwable, URL] =
     defer:
       val path = artifactPath(groupId, Some(ArtifactAndVersion(artifactId, Some(version)))) / filename
-      val (response, url) = Client.requestWithFallback(path, Method.HEAD).run
+      val (response, url) = Client.requestWithFallback(path, Method.HEAD, kind = RequestKind.Immutable).run
       response.status match
         case status if status.isSuccess =>
           ZIO.succeed(url).run
-        case Status.NotFound =>
+        case status if isAbsent(status) =>
           ZIO.fail(NotFoundError(groupId, artifactId, version)).run
         case _ =>
           ZIO.fail(temporaryOrUnknown(response)).run

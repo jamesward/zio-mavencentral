@@ -3,7 +3,7 @@ package com.jamesward.zio_mavencentral
 import MavenCentral.{*, given}
 import zio.*
 import zio.direct.*
-import zio.http.{Client, Path, Response, Status, URL, ZClientAspect}
+import zio.http.{Client, Handler, Method, Path, Response, Routes, Server, Status, URL, ZClientAspect}
 import zio.stream.ZStream
 import zio.test.*
 
@@ -16,6 +16,32 @@ object MavenCentralSpec extends ZIOSpecDefault:
   given CanEqual[Seq[MavenCentral.ArtifactId], Seq[MavenCentral.ArtifactId]] = CanEqual.derived
   given CanEqual[Exit[MavenCentral.NotFoundError | Throwable, ?], Exit[MavenCentral.NotFoundError | Throwable, ?]] = CanEqual.derived
   given CanEqual[MavenCentral.Deploy.DeploymentState, MavenCentral.Deploy.DeploymentState] = CanEqual.derived
+
+  private def failure[E](exit: Exit[E, ?]): Option[E] = exit.causeOption.flatMap(_.failureOption)
+
+  /** The fake mirror answers with the status named by the first path segment (`/404/maven2/...`). */
+  private def statusFor(request: zio.http.Request): Response =
+    Response.status(request.path.segments.headOption.flatMap(_.toIntOption).map(Status.fromInt).getOrElse(Status.InternalServerError))
+
+  private def fakeRepo(port: Int, status: Status): ZLayer[Client, Nothing, MavenCentralRepo] =
+    MavenCentralRepo.custom(mirrors = List(Mirror(URL.decode(s"http://localhost:$port/${status.code}/maven2/").toOption.get, authoritative = true, Listings.Html)))
+
+  /** Every lookup maps `status` to its not-found error. */
+  private def notFoundEverywhere(port: Int, status: Status): ZIO[Client, Nothing, Boolean] =
+    val ga = GroupArtifact(GroupId("com.foo"), ArtifactId("bar"))
+    (mavenMetadata(ga.groupId, ga.artifactId).exit
+      <*> latestOrFail(ga).exit
+      <*> javadocUri(ga.groupId, ga.artifactId, Version("1.0")).exit
+      <*> pom(ga.groupId, ga.artifactId, Version("1.0")).exit
+      <*> searchArtifacts(ga.groupId).exit
+      <*> isModifiedSince(ZonedDateTime.now().nn, ga.groupId, Some(ga.artifactId)).exit
+    ).provideSome[Client](fakeRepo(port, status)).map: (meta, latest, url, pomExit, group, modified) =>
+      failure(meta).exists(_.isInstanceOf[GroupIdOrArtifactIdNotFoundError])
+        && failure(latest).exists(_.isInstanceOf[GroupIdOrArtifactIdNotFoundError])
+        && failure(url).exists(_.isInstanceOf[NotFoundError])
+        && failure(pomExit).exists(_.isInstanceOf[NotFoundError])
+        && failure(group).exists(_.isInstanceOf[GroupIdNotFoundError])
+        && failure(modified).exists(_.isInstanceOf[GroupIdOrArtifactIdNotFoundError])
 
   def spec = suite("MavenCentral")(
     suite("artifacts")(
@@ -92,6 +118,27 @@ object MavenCentralSpec extends ZIOSpecDefault:
         defer:
           assertTrue(latest(GroupId("com.jamesward"), ArtifactId("travis-central-test")).run.get == Version("0.0.15"))
       ,
+      test("coordinates Maven Central rejects with 400 are not found, not errors"):
+        // repo1.maven.org answers 400 for a NUL or invalid UTF-8 in a segment,
+        // and for a segment over ~1,100 characters (issue javadoccentral#270).
+        val malformed = List("x\u0000", "x\uFFFD\u0000", "a" * 1200)
+        defer:
+          val results = ZIO.foreach(malformed): bad =>
+            defer:
+              val ga     = GroupArtifact(GroupId("com.foo"), ArtifactId(bad))
+              val meta   = mavenMetadata(GroupId("com.foo"), ArtifactId(bad)).exit.run
+              val latest = latestOrFail(ga).exit.run
+              val url    = javadocUri(GroupId("com.foo"), ArtifactId(bad), Version("1.0")).exit.run
+              val group  = searchArtifacts(GroupId(bad)).exit.run
+              (meta, latest, url, group)
+          .run
+          assertTrue(results.forall: (meta, latest, url, group) =>
+            meta.causeOption.flatMap(_.failureOption).exists(_.isInstanceOf[GroupIdOrArtifactIdNotFoundError])
+              && latest.causeOption.flatMap(_.failureOption).exists(_.isInstanceOf[GroupIdOrArtifactIdNotFoundError])
+              && url.causeOption.flatMap(_.failureOption).exists(_.isInstanceOf[NotFoundError])
+              && group.causeOption.flatMap(_.failureOption).exists(_.isInstanceOf[GroupIdNotFoundError])
+          )
+      ,
       test("isArtifact"):
         defer:
           assertTrue(
@@ -114,7 +161,8 @@ object MavenCentralSpec extends ZIOSpecDefault:
 
           assertTrue(
             doesNotExist == Exit.fail(NotFoundError(GroupId("com.jamesward"), ArtifactId("travis-central-test"), Version("0.0.15"))),
-            URL.decode("https://repo1.maven.org/maven2/org/webjars/webjars-locator-core/0.52/webjars-locator-core-0.52-javadoc.jar").contains(doesExist),
+            // An immutable file: served by GCS when it has it (it does for an old release).
+            URL.decode(s"${gcsMirror.encode}org/webjars/webjars-locator-core/0.52/webjars-locator-core-0.52-javadoc.jar").contains(doesExist),
           )
       ,
       test("downloadAndExtractZipWithCacheInfo"):
@@ -182,15 +230,11 @@ object MavenCentralSpec extends ZIOSpecDefault:
       ,
       // note that on some networks all DNS requests are accepted and redirect to something like a captive portal, wtf
       test("MavenCentralRepo falls over from a bad mirror to a working one"):
-        // Custom mirror list: a bogus first mirror, then the real primary.
-        // The breaker for the first should trip and the second should serve.
+        // An unreachable authoritative mirror, then the real repo1 as a fallback.
         val badMirror = URL.decode("https://zxcvasdf123124zxcv.com/").toOption.get
         val goodMirror = URL.decode("https://repo1.maven.org/maven2/").toOption.get
         val customRepo = MavenCentralRepo.custom(
-          mirrors = List(badMirror, goodMirror),
-          maxFailures = 1,
-          resetMin = 1.hour,
-          resetMax = 1.hour,
+          mirrors = List(Mirror(badMirror, authoritative = true, Listings.Html), Mirror(goodMirror, authoritative = false, Listings.Unsupported)),
         )
 
         ZIO.serviceWithZIO[MavenCentralRepo]: repo =>
@@ -198,6 +242,25 @@ object MavenCentralSpec extends ZIOSpecDefault:
             (response, _) =>
               assertTrue(response.status.isSuccess)
         .provideSome[Client](customRepo)
+      ,
+      test("with repo1 unreachable, a group listing comes from GCS's bucket API"):
+        val unreachable = URL.decode("https://zxcvasdf123124zxcv.com/maven2/").toOption.get
+        val repo = MavenCentralRepo.custom(mirrors = List(Mirror(unreachable, authoritative = true, Listings.Html), gcsMirrorSpec))
+        defer:
+          val fromGcs   = searchArtifacts(GroupId("com.jamesward")).provideSome[Client](repo).run
+          val fromRepo1 = searchArtifacts(GroupId("com.jamesward")).run
+          assertTrue(
+            fromGcs.servedBy.exists(_.encode.startsWith(gcsMirror.encode)),
+            fromGcs.value.contains(ArtifactId("zio-mavencentral_3")),
+            fromRepo1.value.toSet.subsetOf(fromGcs.value.toSet) || fromGcs.value.toSet.subsetOf(fromRepo1.value.toSet),
+          )
+      ,
+      test("the default mirrors serve a javadoc jar from GCS"):
+        defer:
+          val target = ZIO.attemptBlockingIO(Files.createTempFile("gcs-jar", ".jar").nn.toFile).orDie.run
+          JarCache.mavenCentralDownloader("javadoc")(gav("org.webjars", "webjars-locator-core", "0.52"), target).run
+          val size = ZIO.attemptBlockingIO(target.length()).orDie.run
+          assertTrue(size > 10_000L)
       ,
       test("pom"):
         defer:
@@ -217,6 +280,25 @@ object MavenCentralSpec extends ZIOSpecDefault:
           )
 
     ).provide(Client.default.update(_ @@ ZClientAspect.requestLogging()), MavenCentralRepo.live),
+    suite("upstream statuses (a local fake mirror)")(
+      // The fake mirror answers every request with one status, so each mapping
+      // is tested whatever Maven Central does on the day.
+      test("404, 400 and 414 are not found everywhere"):
+        defer:
+          val port = Server.install(Routes(Method.ANY / zio.http.trailing -> Handler.fromFunction[zio.http.Request](statusFor))).run
+          val results = ZIO.foreach(List(Status.NotFound, Status.BadRequest, Status.RequestUriTooLong))(notFoundEverywhere(port, _)).run
+          assertTrue(results.forall(identity))
+      ,
+      test("latestOrFail types an unreachable upstream as LatestUnavailable, not a defect"):
+        defer:
+          val port = Server.install(Routes(Method.ANY / zio.http.trailing -> Handler.fromFunction[zio.http.Request](statusFor))).run
+          val ga   = GroupArtifact(GroupId("com.foo"), ArtifactId("bar"))
+          val exit = latestOrFail(ga).exit.provideSome[Client](fakeRepo(port, Status.ServiceUnavailable)).run
+          assertTrue(failure(exit).exists:
+            case LatestUnavailable(g, reason) => g == ga && reason.contains("503")
+            case _                            => false
+          )
+    ).provide(Server.defaultWith(_.onAnyOpenPort), Client.default) @@ TestAspect.withLiveClock @@ TestAspect.sequential,
     suite("deploy")(
       test("fail verification"):
         val filename = "momentjs-exists.zip"

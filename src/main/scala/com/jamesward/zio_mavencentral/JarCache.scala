@@ -4,8 +4,8 @@ import com.jamesward.zio_mavencentral.MavenCentral.{GroupArtifactVersion, JarMet
 import zio.*
 import zio.concurrent.ConcurrentMap
 import zio.direct.*
-import zio.http.{Client, URL}
-import zio.stream.ZStream
+import zio.http.{Client, Header, URL}
+import zio.stream.{ZPipeline, ZSink, ZStream}
 
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -287,6 +287,18 @@ object JarCache:
    *  bounded retry recovers it without hammering upstream on a genuinely bad
    *  publish. */
   private[zio_mavencentral] val corruptRetries: Int = 2
+
+  /** Reads `in` to the end. When `size` (an entry's recorded uncompressed
+   *  size) is known, allocates exactly that once. If the stream turns out
+   *  longer than recorded, the rest is appended, so a wrong size never
+   *  truncates; if shorter, the result is the bytes actually read. */
+  private[zio_mavencentral] def readFully(in: java.io.InputStream, size: Long): Array[Byte] =
+    if size < 0 || size > Int.MaxValue - 8 then in.readAllBytes().nn
+    else
+      val bytes = in.readNBytes(size.toInt).nn
+      val next  = in.read()
+      if next == -1 then bytes
+      else Array.concat(bytes, Array(next.toByte), in.readAllBytes().nn)
 
   /** Failure type for entry lookups. Distinct from `NotFoundError`,
    *  which signals the *jar* was not found upstream. */
@@ -584,7 +596,22 @@ object JarCache:
         entry.acquire.flatMap: zip =>
           ZIO.attemptBlockingIO(zip.getEntry(path) != null).orDie
 
-    /** Read one entry's bytes. Random-access into the jar; no full scan. */
+    /**
+     * The uncompressed size of the entry at `path`, from the zip's central
+     * directory: an O(1) lookup that decompresses nothing. `None` when the jar
+     * doesn't record the size. Pair it with [[streamEntry]] to serve an entry
+     * with a `Content-Length`, and to answer a missing entry before streaming.
+     */
+    def entrySize(path: String): IO[JarEntryNotFound, Option[Long]] =
+      ZIO.scoped:
+        entry.acquire.flatMap: zip =>
+          ZIO.attemptBlockingIO(Option(zip.getEntry(path))).orDie
+            .someOrFail(JarEntryNotFound(entry.gav, path))
+            .map(e => Option.when(e.getSize >= 0)(e.getSize))
+
+    /** Read one entry's bytes. Random-access into the jar; no full scan.
+     *  Allocates the entry's size (from the central directory) once, rather
+     *  than `readAllBytes`' growing buffers plus a final copy (~2× the size). */
     def readEntry(path: String): IO[JarEntryNotFound, Array[Byte]] =
       ZIO.scoped:
         entry.acquire.flatMap: zip =>
@@ -593,7 +620,7 @@ object JarCache:
             if e == null then null
             else
               val in = zip.getInputStream(e).nn
-              try in.readAllBytes() finally in.close()
+              try JarCache.readFully(in, e.getSize) finally in.close()
           .orDie
           .flatMap:
             case null  => ZIO.fail(JarEntryNotFound(entry.gav, path))
@@ -721,6 +748,41 @@ object JarCache:
       defer:
         val url = resolveUrl.run
         MavenCentral.downloadJar(url, target).catchAll(upstream).run
+
+  /**
+   * Production downloader: one streaming GET of
+   * `<g>/<a>/<v>/<a>-<v>-<classifier>.jar` through [[MavenCentral.MavenCentralRepo]]
+   * as an immutable file, so it comes from Google's GCS mirror when that has it
+   * (keeping the bulk of the bytes off repo1) and from repo1 otherwise. Only
+   * repo1's 404 is a [[NotFoundError]]; a fallback's 404 when repo1 couldn't be
+   * asked, a network failure, or a 5xx / 429 / 403 from every mirror is an
+   * [[UpstreamUnavailableError]]. Any other failure is a defect.
+   *
+   * A body that stops arriving for `idleTimeout` fails the download (as
+   * upstream-unavailable, so the partial file is discarded and the next `get`
+   * retries). Without it, a stalled transfer would hold its fetch slot forever:
+   * the per-attempt timeout only covers getting the response headers.
+   */
+  def mavenCentralDownloader(classifier: String, idleTimeout: Duration = 30.seconds): (GroupArtifactVersion, File) => ZIO[Client & MavenCentralRepo, JarCache.DownloadError, JarMeta] =
+    (gav, target) =>
+      def upstream(t: Throwable): IO[UpstreamUnavailableError, Nothing] =
+        if isUpstreamFailure(t) then ZIO.fail(UpstreamUnavailableError(gav, describeUpstreamFailure(t)))
+        else ZIO.die(t)
+      val path = MavenCentral.artifactPath(gav.groupId, Some(MavenCentral.ArtifactAndVersion(gav.artifactId, Some(gav.version)))) /
+        s"${gav.artifactId}-${gav.version}-$classifier.jar"
+      ZIO.scoped:
+        ZIO.serviceWithZIO[MavenCentralRepo](_.streaming(path, kind = MavenCentral.RequestKind.Immutable))
+          .catchAll(upstream)
+          .flatMap: (response, _) =>
+            if MavenCentral.isAbsent(response.status) then ZIO.fail(NotFoundError(gav.groupId, gav.artifactId, gav.version))
+            else if !response.status.isSuccess then upstream(MavenCentral.temporaryOrUnknown(response))
+            else
+              response.body.asStream
+                .timeoutFail(java.io.IOException(s"jar download stalled: no bytes for ${idleTimeout.render}"))(idleTimeout)
+                .via(ZPipeline.rechunk(64 * 1024))
+                .run(ZSink.fromPath(target.toPath))
+                .catchAll(upstream)
+                .as(JarMeta(response.header(Header.LastModified).map(_.value), response.header(Header.ETag)))
 
   /**
    * Construct a `JarCache`. The returned ZIO requires a [[zio.Scope]]; when
