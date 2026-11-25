@@ -20,7 +20,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                 % zioVersion,
   "dev.zio" %% "zio-concurrent"      % zioVersion,
   "dev.zio" %% "zio-direct"          % "1.0.0-RC7", // no stable zio-direct release exists yet
-  "dev.zio" %% "zio-http"            % "3.11.6",
+  "dev.zio" %% "zio-http"            % "3.12.0",
   "dev.zio" %% "zio-schema-derivation" % "1.9.2",
 
   "nl.vroste" %% "rezilience" % "0.10.6",

@@ -37,6 +37,10 @@ Extract the Skills with `./sbta extractSkillsJars` (into `.kiro/skills/`) and re
 - Most tests hit the real (free) Maven Central over the network. The Sonatype `upload and verify`
   test publishes for real and only runs when `OSS_DEPLOY_USERNAME` and `OSS_DEPLOY_PASSWORD` are
   set — do not set them unless explicitly asked.
+- In Claude Code cloud sessions, `MavenCentralSpec` "coordinates Maven Central rejects with 400 are
+  not found, not errors" fails for the 1,200-character artifactId: the session's egress answers
+  zio-http's HEAD for that path with 503 (curl gets repo1's 400), so `javadocUri` fails with
+  `NotFoundOnFallback`. It passes in CI; there, treat the PR's CI as the authority for that test.
 
 ## Maintenance routine
 
